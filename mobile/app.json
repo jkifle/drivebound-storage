@@ -1,0 +1,51 @@
+{
+  "expo": {
+    "name": "Drivebound Backup",
+    "slug": "drivebound-backup",
+    "scheme": "drivebound",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Drivebound needs photo access to back up your library.",
+          "savePhotosPermission": "Drivebound can restore media to your library.",
+          "isAccessMediaLocationEnabled": true
+        }
+      ]
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "processing"
+        ],
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true
+        }
+      }
+    },
+    "android": {
+      "usesCleartextTraffic": true,
+      "permissions": [
+        "READ_MEDIA_IMAGES",
+        "READ_MEDIA_VIDEO",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.ACCESS_MEDIA_LOCATION",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO"
+      ],
+      "package": "com.jkifle.driveboundbackup"
+    },
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

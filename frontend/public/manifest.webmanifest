@@ -1,0 +1,17 @@
+{
+  "name": "Drivebound",
+  "short_name": "Drivebound",
+  "description": "Expandable personal cloud storage backed by drives you own.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f1e9",
+  "theme_color": "#183229",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
