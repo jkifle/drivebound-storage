@@ -100,7 +100,7 @@ android {
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
-        versionName "0.1.0"
+        versionName "0.2.0"
 
         buildConfigField "String", "REACT_NATIVE_RELEASE_LEVEL", "\"${findProperty('reactNativeReleaseLevel') ?: 'stable'}\""
     }
@@ -111,15 +111,33 @@ android {
             keyAlias 'androiddebugkey'
             keyPassword 'android'
         }
+        release {
+            def releaseStoreFile = findProperty('DRIVEBOUND_RELEASE_STORE_FILE') ?: System.getenv('DRIVEBOUND_RELEASE_STORE_FILE')
+            def releaseStorePassword = findProperty('DRIVEBOUND_RELEASE_STORE_PASSWORD') ?: System.getenv('DRIVEBOUND_RELEASE_STORE_PASSWORD')
+            def releaseKeyAlias = findProperty('DRIVEBOUND_RELEASE_KEY_ALIAS') ?: System.getenv('DRIVEBOUND_RELEASE_KEY_ALIAS')
+            def releaseKeyPassword = findProperty('DRIVEBOUND_RELEASE_KEY_PASSWORD') ?: System.getenv('DRIVEBOUND_RELEASE_KEY_PASSWORD')
+            if (releaseStoreFile && releaseStorePassword && releaseKeyAlias && releaseKeyPassword) {
+                storeFile file(releaseStoreFile)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
     }
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
         }
         release {
-            // Caution! In production, you need to generate your own keystore file.
-            // see https://reactnative.dev/docs/signed-apk-android.
-            signingConfig signingConfigs.debug
+            def hasReleaseSigning = (findProperty('DRIVEBOUND_RELEASE_STORE_FILE') ?: System.getenv('DRIVEBOUND_RELEASE_STORE_FILE')) &&
+                (findProperty('DRIVEBOUND_RELEASE_STORE_PASSWORD') ?: System.getenv('DRIVEBOUND_RELEASE_STORE_PASSWORD')) &&
+                (findProperty('DRIVEBOUND_RELEASE_KEY_ALIAS') ?: System.getenv('DRIVEBOUND_RELEASE_KEY_ALIAS')) &&
+                (findProperty('DRIVEBOUND_RELEASE_KEY_PASSWORD') ?: System.getenv('DRIVEBOUND_RELEASE_KEY_PASSWORD'))
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            } else {
+                logger.lifecycle("Drivebound release signing is not configured; EAS credentials or DRIVEBOUND_RELEASE_* values are required for a distributable build.")
+            }
             def enableShrinkResources = findProperty('android.enableShrinkResourcesInReleaseBuilds') ?: 'false'
             shrinkResources enableShrinkResources.toBoolean()
             minifyEnabled enableMinifyInReleaseBuilds

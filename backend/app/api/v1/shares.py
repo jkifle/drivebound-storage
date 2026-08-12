@@ -2,18 +2,19 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.security import current_user, hash_password, opaque_token, token_digest, verify_password
+from app.core.security import current_user_or_device, hash_password, opaque_token, token_digest, verify_password
 from app.db.session import get_db
 from app.models.asset import Asset
 from app.models.share import ShareLink
 from app.models.user import User
 from app.schemas.share import PublicShareResponse, ShareCreate, ShareResponse
 from app.services.storage import validated_external_path, validated_storage_path
+from app.services.media_delivery import media_response
 
 router = APIRouter(prefix="/shares", tags=["sharing"])
 
@@ -38,7 +39,7 @@ async def resolve_share(session: AsyncSession, token: str, password: str | None)
 async def create_share(
     payload: ShareCreate,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> ShareResponse:
     asset = await session.scalar(select(Asset).where(Asset.id == payload.asset_id, Asset.user_id == user.id))
     if asset is None:
@@ -84,12 +85,12 @@ async def public_share(
     )
 
 
-@router.get("/public/{token}/content", response_class=FileResponse)
+@router.get("/public/{token}/content")
 async def public_share_content(
     token: str,
     x_share_password: str | None = Header(default=None),
     session: AsyncSession = Depends(get_db),
-) -> FileResponse:
+) -> Response:
     share, asset = await resolve_share(session, token, x_share_password)
     path = (
         validated_external_path(asset.original_path)
@@ -99,4 +100,7 @@ async def public_share_content(
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Shared file is unavailable")
     disposition = "attachment" if share.allow_download else "inline"
-    return FileResponse(path, media_type=asset.mime_type, filename=asset.original_filename, content_disposition_type=disposition)
+    owner = await session.get(User, asset.user_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Shared file is unavailable")
+    return media_response(asset, owner, path, media_type=asset.mime_type, filename=asset.original_filename, content_disposition_type=disposition)

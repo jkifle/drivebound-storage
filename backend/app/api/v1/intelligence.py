@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.assets import timeline_item
-from app.core.security import current_user
+from app.core.security import current_user_or_device
 from app.db.session import get_db
 from app.models.asset import Asset
 from app.models.user import User
@@ -21,7 +21,7 @@ async def semantic_search(
     query: str = Query(min_length=2, max_length=500),
     limit: int = Query(default=50, ge=1, le=200),
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> list[SemanticResult]:
     query_vector = await asyncio.to_thread(embed_text, query, True)
     distance = Asset.embedding.cosine_distance(query_vector).label("distance")
@@ -34,7 +34,7 @@ async def semantic_search(
 @router.post("/reindex", response_model=ReindexResponse)
 async def reindex(
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> ReindexResponse:
     asset_ids = (await session.scalars(select(Asset.id).where(Asset.user_id == user.id))).all()
     for asset_id in asset_ids:

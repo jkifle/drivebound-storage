@@ -1,8 +1,10 @@
 # Drivebound mobile backup
 
-This Expo client registers a revocable device credential, scans the native photo library, and resumes chunked uploads. Capture time, modification time, EXIF, GPS, filenames, and the untouched original bytes flow through the same server ingestion pipeline as web uploads.
+This Expo client registers a revocable device credential, browses the Drivebound library, and uses a SQLite-backed queue to resume chunked camera-roll uploads. Capture time, modification time, EXIF, GPS, filenames, and the untouched original bytes flow through the same server ingestion pipeline as web uploads.
 
-Use `npm install`, then `npx expo run:android` or `npx expo run:ios`. Background tasks require a development/native build; they do not run in Expo Go. A physical phone must use the computer's LAN or HTTPS address instead of `localhost`.
+Use `npm install`, then `npx expo run:android` or `npx expo run:ios`. Background tasks and push notifications require a development/native build; they do not run in Expo Go. A physical phone must use the computer's LAN or HTTPS address instead of `localhost`.
+
+The Backup tab exposes Wi-Fi-only, charging-only, bandwidth, and schedule controls. The Discover tab exposes search, albums, memories, and location links. Opening media supports video playback, sharing, and downloading an original to the phone library. See [RELEASE.md](RELEASE.md) for TestFlight, Play, and signing setup.
 
 For the standard Android emulator, use `http://10.0.2.2:8000`; Android reserves `10.0.2.2` as the host computer's loopback address. For an emulator or USB-connected device, `adb reverse tcp:8000 tcp:8000` also makes `http://localhost:8000` reach the host backend. The reverse tunnel must be recreated after the emulator/device or ADB server restarts.
 

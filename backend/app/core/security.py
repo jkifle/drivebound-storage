@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import jwt
 from cryptography.fernet import Fernet, InvalidToken as InvalidFernetToken
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from jwt.exceptions import InvalidTokenError
 from pwdlib import PasswordHash
@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.db.session import get_db
 from app.models.auth import AuthSession
+from app.models.device import Device
 from app.models.user import User
 
 password_hash = PasswordHash.recommended()
@@ -84,6 +85,26 @@ async def current_auth(
 
 async def current_user(auth: tuple[User, AuthSession] = Depends(current_auth)) -> User:
     return auth[0]
+
+
+async def current_user_or_device(
+    request: Request,
+    token: str | None = Depends(oauth2_scheme),
+    x_device_token: str | None = Header(default=None),
+    session: AsyncSession = Depends(get_db),
+) -> User:
+    """Authorize browser sessions or a revocable native-device credential."""
+    if token or request.cookies.get(settings.auth_cookie_name):
+        return await current_user(await current_auth(request, token, session))
+    if x_device_token:
+        device = await session.scalar(select(Device).where(Device.token_hash == token_digest(x_device_token)))
+        if device is not None:
+            user = await session.get(User, device.user_id)
+            if user is not None and user.disabled_at is None:
+                device.last_seen_at = datetime.now(timezone.utc)
+                await session.commit()
+                return user
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
 
 
 def opaque_token(length: int = 32) -> str:

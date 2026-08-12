@@ -30,6 +30,9 @@ services:
     build:
       context: ./backend
     environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-hybrid}
+      CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-}
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://photos:change-me@postgres:5432/photos}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       ORIGINALS_PATH: /data/originals
@@ -63,6 +66,10 @@ services:
       SEMANTIC_ENABLED: ${SEMANTIC_ENABLED:-true}
       OCR_ENABLED: ${OCR_ENABLED:-true}
       INTELLIGENCE_CACHE_PATH: /data/models
+      MEDIA_ENCRYPTION_ENABLED: ${MEDIA_ENCRYPTION_ENABLED:-true}
+      MEDIA_ENCRYPTION_MASTER_KEY: ${MEDIA_ENCRYPTION_MASTER_KEY:-RZAIpFM5CAciKTy4UABCTvvyD83LfeB9r_ZR4z0LnKQ=}
+      MEDIA_ENCRYPTION_MIGRATE_LEGACY: ${MEDIA_ENCRYPTION_MIGRATE_LEGACY:-false}
+      OBSERVABILITY_LOG_JSON: ${OBSERVABILITY_LOG_JSON:-false}
     volumes:
       - ./data/originals:/data/originals
       - ./data/derivatives:/data/derivatives
@@ -89,6 +96,7 @@ services:
     build:
       context: ./backend
     environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://photos:change-me@postgres:5432/photos}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       ORIGINALS_PATH: /data/originals
@@ -100,6 +108,8 @@ services:
       SEMANTIC_ENABLED: ${SEMANTIC_ENABLED:-true}
       OCR_ENABLED: ${OCR_ENABLED:-true}
       INTELLIGENCE_CACHE_PATH: /data/models
+      MEDIA_ENCRYPTION_ENABLED: ${MEDIA_ENCRYPTION_ENABLED:-true}
+      MEDIA_ENCRYPTION_MASTER_KEY: ${MEDIA_ENCRYPTION_MASTER_KEY:-RZAIpFM5CAciKTy4UABCTvvyD83LfeB9r_ZR4z0LnKQ=}
     volumes:
       - ./data/originals:/data/originals
       - ./data/derivatives:/data/derivatives
@@ -124,12 +134,16 @@ services:
     build:
       context: ./backend
     environment:
+      ENVIRONMENT: ${ENVIRONMENT:-development}
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://photos:change-me@postgres:5432/photos}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       ORIGINALS_PATH: /data/originals
       REPLICA_PATH: /data/replicas
       EXTERNAL_LIBRARY_ROOTS: ${EXTERNAL_LIBRARY_ROOTS:-/data/imports}
       MONITOR_INTERVAL_SECONDS: ${MONITOR_INTERVAL_SECONDS:-900}
+      MEDIA_ENCRYPTION_ENABLED: ${MEDIA_ENCRYPTION_ENABLED:-true}
+      MEDIA_ENCRYPTION_MASTER_KEY: ${MEDIA_ENCRYPTION_MASTER_KEY:-RZAIpFM5CAciKTy4UABCTvvyD83LfeB9r_ZR4z0LnKQ=}
+      MEDIA_ENCRYPTION_MIGRATE_LEGACY: ${MEDIA_ENCRYPTION_MIGRATE_LEGACY:-false}
     volumes:
       - ./data/originals:/data/originals
       - ./data/replicas:/data/replicas

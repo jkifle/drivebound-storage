@@ -20,4 +20,6 @@ class Device(Base):
     last_backup_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     files_backed_up: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     bytes_backed_up: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    push_token: Mapped[str | None] = mapped_column(String(255), unique=True)
+    push_token_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

@@ -1,0 +1,65 @@
+# Staging/production overlay. Secret values are mounted as files supplied by
+# the deployment platform; they never belong in .env or this repository.
+services:
+  postgres:
+    environment:
+      POSTGRES_PASSWORD: ""
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+  backend:
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DEPLOYMENT_MODE: hybrid
+      CONTROL_PLANE_URL: ${CONTROL_PLANE_URL}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      REDIS_URL_FILE: /run/secrets/redis_url
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      MFA_ENCRYPTION_SECRET_FILE: /run/secrets/mfa_encryption_secret
+      MEDIA_ENCRYPTION_MASTER_KEY_FILE: /run/secrets/media_encryption_master_key
+      MEDIA_ENCRYPTION_ENABLED: "true"
+      OBSERVABILITY_LOG_JSON: "true"
+      REMOTE_ACCESS_ENABLED: "true"
+    secrets:
+      - database_url
+      - redis_url
+      - jwt_secret
+      - mfa_encryption_secret
+      - media_encryption_master_key
+  worker:
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      REDIS_URL_FILE: /run/secrets/redis_url
+      MEDIA_ENCRYPTION_MASTER_KEY_FILE: /run/secrets/media_encryption_master_key
+      MEDIA_ENCRYPTION_ENABLED: "true"
+    secrets:
+      - database_url
+      - redis_url
+      - media_encryption_master_key
+  scheduler:
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DATABASE_URL_FILE: /run/secrets/database_url
+      REDIS_URL_FILE: /run/secrets/redis_url
+      MEDIA_ENCRYPTION_MASTER_KEY_FILE: /run/secrets/media_encryption_master_key
+      MEDIA_ENCRYPTION_ENABLED: "true"
+      MEDIA_ENCRYPTION_MIGRATE_LEGACY: ${MEDIA_ENCRYPTION_MIGRATE_LEGACY:-false}
+    secrets:
+      - database_url
+      - redis_url
+      - media_encryption_master_key
+
+secrets:
+  database_url:
+    file: ./.secrets/database_url
+  redis_url:
+    file: ./.secrets/redis_url
+  jwt_secret:
+    file: ./.secrets/jwt_secret
+  mfa_encryption_secret:
+    file: ./.secrets/mfa_encryption_secret
+  media_encryption_master_key:
+    file: ./.secrets/media_encryption_master_key
+  postgres_password:
+    file: ./.secrets/postgres_password

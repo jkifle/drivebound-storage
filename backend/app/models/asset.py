@@ -22,6 +22,8 @@ class Asset(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), index=True)
     original_path: Mapped[str] = mapped_column(Text, nullable=False)
     checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    storage_checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    encryption_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     file_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
     width: Mapped[int | None] = mapped_column(Integer)

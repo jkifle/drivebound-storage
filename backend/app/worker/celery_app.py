@@ -15,6 +15,11 @@ celery_app.conf.update(
             "task": "monitor_storage",
             "schedule": settings.monitor_interval_seconds,
         }
-    },
+    } | ({
+        "migrate-legacy-media-encryption": {
+            "task": "migrate_legacy_media",
+            "schedule": 60,
+        }
+    } if settings.media_encryption_migrate_legacy else {}),
 )
 celery_app.autodiscover_tasks(["app.worker"])

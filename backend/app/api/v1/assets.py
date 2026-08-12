@@ -2,18 +2,20 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.security import current_user
+from app.core.security import current_user_or_device
 from app.db.session import get_db
 from app.models.asset import Asset
+from app.models.album import Album, AlbumAsset, AlbumMember
 from app.models.replica import AssetReplica
 from app.models.user import User
 from app.schemas.asset import AssetResponse, TimelineAssetResponse, TimelineResponse, UploadResponse
 from app.services.ingestion import persist_managed_asset
+from app.services.media_delivery import media_response
 from app.services.storage import stage_upload, validated_external_path, validated_storage_path
 from app.services.timeline import TimelineCursor, decode_cursor, encode_cursor
 from app.worker.tasks import process_asset_task, protect_asset_task, restore_asset_task
@@ -23,6 +25,21 @@ router = APIRouter(prefix="/assets", tags=["assets"])
 
 async def asset_by_checksum(session: AsyncSession, user_id: uuid.UUID, checksum: str) -> Asset | None:
     return await session.scalar(select(Asset).where(Asset.user_id == user_id, Asset.checksum == checksum))
+
+
+async def readable_asset(session: AsyncSession, user_id: uuid.UUID, asset_id: uuid.UUID) -> Asset | None:
+    """Allow an owner or a member of an album containing the asset to read it."""
+    return await session.scalar(
+        select(Asset)
+        .outerjoin(AlbumAsset, AlbumAsset.asset_id == Asset.id)
+        .outerjoin(Album, Album.id == AlbumAsset.album_id)
+        .outerjoin(AlbumMember, AlbumMember.album_id == Album.id, full=False)
+        .where(
+            Asset.id == asset_id,
+            or_(Asset.user_id == user_id, Album.user_id == user_id, AlbumMember.user_id == user_id),
+        )
+        .distinct()
+    )
 
 
 def timeline_statement(user_id: uuid.UUID, limit: int, cursor: TimelineCursor | None = None):
@@ -67,7 +84,7 @@ async def list_assets(
     limit: int = Query(default=100, ge=1, le=200),
     cursor: str | None = None,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> TimelineResponse:
     decoded_cursor = decode_cursor(cursor) if cursor is not None else None
     assets = list((await session.scalars(timeline_statement(user.id, limit, decoded_cursor))).all())
@@ -90,7 +107,7 @@ async def upload_asset(
     file_created_at: datetime | None = Form(default=None),
     file_modified_at: datetime | None = Form(default=None),
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> UploadResponse:
     staged_path, checksum, file_size = await stage_upload(file)
     asset, duplicate = await persist_managed_asset(
@@ -121,7 +138,7 @@ async def upload_asset(
 @router.get("/protection/status")
 async def protection_status(
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> dict[str, int]:
     rows = (
         await session.execute(
@@ -143,7 +160,7 @@ async def protection_status(
 @router.post("/metadata/reindex", status_code=status.HTTP_202_ACCEPTED)
 async def reindex_asset_metadata(
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> dict[str, int]:
     assets = list((await session.scalars(select(Asset).where(Asset.user_id == user.id))).all())
     queued = 0
@@ -161,7 +178,7 @@ async def reindex_asset_metadata(
 @router.post("/protection/protect-all", status_code=status.HTTP_202_ACCEPTED)
 async def protect_all_assets(
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> dict[str, int]:
     assets = list((await session.scalars(
         select(Asset)
@@ -189,9 +206,9 @@ async def protect_all_assets(
 async def get_asset(
     asset_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> Asset:
-    asset = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
+    asset = await readable_asset(session, user.id, asset_id)
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     return asset
@@ -201,7 +218,7 @@ async def get_asset(
 async def restore_asset_copy(
     asset_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> Asset:
     asset = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
     if asset is None:
@@ -222,7 +239,7 @@ async def restore_asset_copy(
 async def protect_asset_copy(
     asset_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> Asset:
     asset = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
     if asset is None:
@@ -237,13 +254,13 @@ async def protect_asset_copy(
     return asset
 
 
-@router.get("/{asset_id}/original", response_class=FileResponse)
+@router.get("/{asset_id}/original")
 async def get_original(
     asset_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
-) -> FileResponse:
-    asset = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
+    user: User = Depends(current_user_or_device),
+) -> Response:
+    asset = await readable_asset(session, user.id, asset_id)
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     path = (
@@ -253,19 +270,25 @@ async def get_original(
     )
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Original file is unavailable")
-    return FileResponse(path, media_type=asset.mime_type)
+    owner = user if asset.user_id == user.id else await session.get(User, asset.user_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Original file is unavailable")
+    return media_response(asset, owner, path, media_type=asset.mime_type, filename=asset.original_filename, content_disposition_type="inline")
 
 
-@router.get("/{asset_id}/thumbnail", response_class=FileResponse)
+@router.get("/{asset_id}/thumbnail")
 async def get_thumbnail(
     asset_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
-) -> FileResponse:
-    asset = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
+    user: User = Depends(current_user_or_device),
+) -> Response:
+    asset = await readable_asset(session, user.id, asset_id)
     if asset is None or asset.thumbnail_path is None:
         raise HTTPException(status_code=404, detail="Thumbnail is not available")
     path = validated_storage_path(asset.thumbnail_path, settings.derivatives_path)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Thumbnail is not available")
-    return FileResponse(path, media_type="image/webp")
+    owner = user if asset.user_id == user.id else await session.get(User, asset.user_id)
+    if owner is None:
+        raise HTTPException(status_code=404, detail="Thumbnail is not available")
+    return media_response(asset, owner, path, media_type="image/webp", content_disposition_type="inline")

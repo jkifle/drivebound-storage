@@ -39,9 +39,10 @@ async def health(response: Response) -> dict[str, object]:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
     return {
         "status": "ok" if healthy else "unhealthy",
+        "deployment_mode": settings.deployment_mode,
+        "media_encryption": "enabled" if settings.media_encryption_enabled else "disabled",
         "services": {
             "postgres": "ok" if postgres_ok else "unavailable",
             "redis": "ok" if redis_ok else "unavailable",
         },
     }
-

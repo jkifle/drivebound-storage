@@ -6,7 +6,7 @@ from sqlalchemy import Text, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.assets import timeline_item
-from app.core.security import current_user
+from app.core.security import current_user_or_device
 from app.db.session import get_db
 from app.core.config import settings
 from app.core.security import opaque_token, token_digest
@@ -62,7 +62,7 @@ async def list_files(
     query: str | None = None,
     limit: int = Query(default=200, ge=1, le=500),
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> list[FileItem]:
     statement = select(Asset).where(Asset.user_id == user.id)
     if path:
@@ -78,7 +78,7 @@ async def search_assets(
     query: str = Query(min_length=1, max_length=255),
     limit: int = Query(default=100, ge=1, le=200),
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> list[TimelineAssetResponse]:
     pattern = f"%{query}%"
     assets = (
@@ -108,7 +108,7 @@ async def search_assets(
 async def map_assets(
     limit: int = Query(default=500, ge=1, le=2000),
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> list[MapItem]:
     assets = (
         await session.scalars(
@@ -135,7 +135,7 @@ async def map_assets(
 async def memories(
     limit: int = Query(default=100, ge=1, le=300),
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> list[TimelineAssetResponse]:
     today = datetime.now(timezone.utc)
     assets = (await session.scalars(select(Asset).where(
@@ -151,7 +151,7 @@ async def memories(
 async def create_album(
     payload: AlbumCreate,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> AlbumResponse:
     album = Album(user_id=user.id, name=payload.name, description=payload.description)
     session.add(album)
@@ -163,7 +163,7 @@ async def create_album(
 @router.get("/albums", response_model=list[AlbumResponse])
 async def list_albums(
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> list[AlbumResponse]:
     rows = (
         await session.execute(
@@ -199,7 +199,7 @@ async def update_album(
     album_id: uuid.UUID,
     payload: AlbumUpdate,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> AlbumResponse:
     album, _ = require_role(await album_role(session, album_id, user.id), "editor")
     if payload.name is not None:
@@ -216,7 +216,7 @@ async def update_album(
 async def delete_album(
     album_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> None:
     album = await session.scalar(select(Album).where(Album.id == album_id, Album.user_id == user.id))
     if album is None:
@@ -230,7 +230,7 @@ async def add_album_asset(
     album_id: uuid.UUID,
     asset_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> None:
     album, _ = require_role(await album_role(session, album_id, user.id), "editor")
     asset = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
@@ -245,7 +245,7 @@ async def add_album_asset(
 async def list_album_assets(
     album_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> list[TimelineAssetResponse]:
     require_role(await album_role(session, album_id, user.id))
     assets = (
@@ -264,7 +264,7 @@ async def remove_album_asset(
     album_id: uuid.UUID,
     asset_id: uuid.UUID,
     session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
+    user: User = Depends(current_user_or_device),
 ) -> None:
     album, _ = require_role(await album_role(session, album_id, user.id), "editor")
     membership = await session.get(AlbumAsset, (album_id, asset_id))
@@ -276,7 +276,7 @@ async def remove_album_asset(
 @router.post("/albums/{album_id}/invites", response_model=AlbumInviteResponse)
 async def invite_album_member(
     album_id: uuid.UUID, payload: AlbumInviteCreate,
-    session: AsyncSession = Depends(get_db), user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_db), user: User = Depends(current_user_or_device),
 ) -> AlbumInviteResponse:
     album, _ = require_role(await album_role(session, album_id, user.id), "owner")
     token = opaque_token(40)
@@ -290,7 +290,7 @@ async def invite_album_member(
 
 
 @router.post("/albums/invitations/{token}/accept", status_code=status.HTTP_204_NO_CONTENT)
-async def accept_album_invite(token: str, session: AsyncSession = Depends(get_db), user: User = Depends(current_user)) -> None:
+async def accept_album_invite(token: str, session: AsyncSession = Depends(get_db), user: User = Depends(current_user_or_device)) -> None:
     now = datetime.now(timezone.utc)
     invite = await session.scalar(select(AlbumInvite).where(AlbumInvite.token_hash == token_digest(token), AlbumInvite.accepted_at.is_(None), AlbumInvite.expires_at > now).with_for_update())
     if invite is None:
@@ -304,7 +304,7 @@ async def accept_album_invite(token: str, session: AsyncSession = Depends(get_db
 
 
 @router.get("/albums/{album_id}/members", response_model=list[AlbumMemberResponse])
-async def album_members(album_id: uuid.UUID, session: AsyncSession = Depends(get_db), user: User = Depends(current_user)) -> list[AlbumMemberResponse]:
+async def album_members(album_id: uuid.UUID, session: AsyncSession = Depends(get_db), user: User = Depends(current_user_or_device)) -> list[AlbumMemberResponse]:
     album, _ = require_role(await album_role(session, album_id, user.id))
     owner = await session.get(User, album.user_id)
     rows = (await session.execute(select(AlbumMember, User).join(User, User.id == AlbumMember.user_id).where(AlbumMember.album_id == album_id))).all()
@@ -314,7 +314,7 @@ async def album_members(album_id: uuid.UUID, session: AsyncSession = Depends(get
 
 
 @router.delete("/albums/{album_id}/members/{member_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def remove_album_member(album_id: uuid.UUID, member_id: uuid.UUID, session: AsyncSession = Depends(get_db), user: User = Depends(current_user)) -> None:
+async def remove_album_member(album_id: uuid.UUID, member_id: uuid.UUID, session: AsyncSession = Depends(get_db), user: User = Depends(current_user_or_device)) -> None:
     require_role(await album_role(session, album_id, user.id), "owner")
     member = await session.get(AlbumMember, (album_id, member_id))
     if member is not None:

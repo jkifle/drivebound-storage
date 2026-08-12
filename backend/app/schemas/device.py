@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -30,3 +31,14 @@ class DeviceRegistration(DeviceResponse):
 class BackupStatus(BaseModel):
     exists: bool
     asset_id: uuid.UUID | None = None
+
+
+class DevicePushTokenUpdate(BaseModel):
+    token: str | None = Field(default=None, max_length=255)
+
+
+class BackupEventNotification(BaseModel):
+    kind: Literal["completed", "failed"]
+    uploaded: int = Field(default=0, ge=0)
+    skipped: int = Field(default=0, ge=0)
+    detail: str | None = Field(default=None, max_length=240)

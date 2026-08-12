@@ -1,14 +1,21 @@
 {
   "expo": {
-    "name": "Drivebound Backup",
-    "slug": "drivebound-backup",
+    "name": "Drivebound",
+    "slug": "drivebound",
     "scheme": "drivebound",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
     "plugins": [
       "expo-router",
       "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "color": "#2266d5",
+          "defaultChannel": "backups"
+        }
+      ],
       [
         "expo-media-library",
         {
@@ -20,9 +27,12 @@
     ],
     "ios": {
       "supportsTablet": true,
+      "bundleIdentifier": "com.jkifle.driveboundbackup",
+      "buildNumber": "1",
       "infoPlist": {
         "UIBackgroundModes": [
-          "processing"
+          "processing",
+          "remote-notification"
         ],
         "NSAppTransportSecurity": {
           "NSAllowsLocalNetworking": true
@@ -39,10 +49,13 @@
         "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
         "android.permission.ACCESS_MEDIA_LOCATION",
         "android.permission.READ_MEDIA_IMAGES",
-        "android.permission.READ_MEDIA_VIDEO",
-        "android.permission.READ_MEDIA_AUDIO"
+        "android.permission.READ_MEDIA_VIDEO"
       ],
-      "package": "com.jkifle.driveboundbackup"
+      "package": "com.jkifle.driveboundbackup",
+      "versionCode": 1
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
     },
     "experiments": {
       "typedRoutes": true

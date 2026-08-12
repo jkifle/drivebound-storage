@@ -1,19 +1,31 @@
 import hashlib
 import os
 import shutil
+import tempfile
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 import aiofiles
 from fastapi import HTTPException, UploadFile, status
 
 from app.core.config import settings
+from app.services.encryption import decrypt_file, encrypt_file
 
-def original_path_for(checksum: str, filename: str | None) -> Path:
+def original_path_for(checksum: str, filename: str | None, user_id: uuid.UUID | None = None) -> Path:
     # Content identity, not a client-controlled filename, determines the path.
     # Keeping the path extensionless makes concurrent identical uploads contend
     # for one exclusive-create operation even when their filenames differ.
+    # Encrypted assets cannot be deduplicated across accounts because each
+    # account has its own data key. Preserve the legacy layout for pre-v1 data.
+    if user_id is not None:
+        return settings.originals_path / str(user_id) / checksum[:2] / checksum
     return settings.originals_path / checksum[:2] / checksum
+
+
+def derivative_path_for(kind: str, checksum: str, user_id: uuid.UUID) -> Path:
+    return settings.derivatives_path / kind / str(user_id) / checksum[:2] / f"{checksum}.webp"
 
 
 async def stage_upload(upload: UploadFile) -> tuple[Path, str, int]:
@@ -65,6 +77,42 @@ def commit_original(staged_path: Path, final_path: Path) -> bool:
     finally:
         staged_path.unlink(missing_ok=True)
     return created
+
+
+def commit_encrypted_original(staged_path: Path, final_path: Path, key: bytes) -> bool:
+    """Encrypt a completed upload while publishing it exactly once."""
+    try:
+        encrypt_file(staged_path, final_path, key)
+        return True
+    except FileExistsError:
+        return False
+    finally:
+        staged_path.unlink(missing_ok=True)
+
+
+def commit_encrypted_derivative(staged_path: Path, final_path: Path, key: bytes) -> bool:
+    try:
+        encrypt_file(staged_path, final_path, key)
+        return True
+    except FileExistsError:
+        return False
+    finally:
+        staged_path.unlink(missing_ok=True)
+
+
+@contextmanager
+def decrypted_temporary_file(source: Path, key: bytes, suffix: str = "") -> Iterator[Path]:
+    """Expose authenticated plaintext only for the duration of a worker task."""
+    settings.staging_path.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_path = tempfile.mkstemp(prefix="decrypt-", suffix=suffix, dir=settings.staging_path)
+    os.close(descriptor)
+    destination = Path(raw_path)
+    destination.unlink(missing_ok=True)
+    try:
+        decrypt_file(source, destination, key)
+        yield destination
+    finally:
+        destination.unlink(missing_ok=True)
 
 
 def validated_storage_path(stored_path: str, root: Path) -> Path:

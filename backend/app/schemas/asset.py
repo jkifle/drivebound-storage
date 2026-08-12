@@ -10,6 +10,7 @@ class AssetResponse(BaseModel):
     id: uuid.UUID
     user_id: uuid.UUID
     checksum: str
+    encryption_version: int
     file_size: int
     mime_type: str
     width: int | None

@@ -6,9 +6,11 @@ import re
 import shutil
 import subprocess
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
+from typing import Iterator
 
 from PIL import ExifTags, Image, ImageOps
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -20,8 +22,20 @@ from app.models.asset import Asset
 from app.models.external_library import ExternalLibrary
 from app.models.replica import AssetReplica
 from app.models.monitoring import MonitoringEvent
+from app.models.user import User
+from app.services.ingestion import user_media_key
+from app.services.encryption import encrypt_file
 from app.services.intelligence import embed_text, extract_ocr
-from app.services.storage import original_path_for, sha256_file, validated_external_path, validated_storage_path
+from app.services.notifications import notify_user_devices
+from app.services.storage import (
+    commit_encrypted_derivative,
+    decrypted_temporary_file,
+    derivative_path_for,
+    original_path_for,
+    sha256_file,
+    validated_external_path,
+    validated_storage_path,
+)
 from app.worker.celery_app import celery_app
 
 
@@ -175,6 +189,20 @@ def extract_video_metadata(original: Path, fallback: datetime) -> dict[str, obje
     return video_metadata_from_probe(json.loads(completed.stdout), fallback)
 
 
+@contextmanager
+def plaintext_asset_file(asset: Asset, user: User | None) -> Iterator[Path]:
+    """Provide plaintext to a processor without leaving it in permanent storage."""
+    source = Path(asset.original_path)
+    if asset.encryption_version:
+        if user is None:
+            raise ValueError("Encrypted asset is missing its owning account")
+        suffix = Path(asset.original_filename or "").suffix
+        with decrypted_temporary_file(source, user_media_key(user), suffix) as plaintext:
+            yield plaintext
+    else:
+        yield source
+
+
 async def process_asset(asset_id: uuid.UUID) -> None:
     engine = create_async_engine(settings.database_url, poolclass=NullPool)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -188,29 +216,40 @@ async def process_asset(asset_id: uuid.UUID) -> None:
             await session.commit()
 
             try:
-                if asset.mime_type.startswith("video/"):
-                    metadata = await asyncio.to_thread(
-                        extract_video_metadata,
-                        Path(asset.original_path),
-                        asset.file_modified_at or asset.created_at,
-                    )
-                    for field, value in metadata.items():
-                        setattr(asset, field, value)
-                    asset.processing_status = "complete"
-                elif not asset.mime_type.startswith("image/"):
-                    asset.taken_at = asset.file_modified_at or asset.created_at
-                    asset.processing_status = "complete"
-                else:
-                    thumbnail = settings.derivatives_path / "thumbnails" / asset.checksum[:2] / f"{asset.checksum}.webp"
-                    metadata = await asyncio.to_thread(
-                        extract_and_thumbnail,
-                        Path(asset.original_path),
-                        thumbnail,
-                        asset.file_modified_at or asset.created_at,
-                    )
-                    for field, value in metadata.items():
-                        setattr(asset, field, value)
-                    asset.processing_status = "complete"
+                user = await session.get(User, asset.user_id) if asset.encryption_version else None
+                with plaintext_asset_file(asset, user) as original:
+                    if asset.mime_type.startswith("video/"):
+                        metadata = await asyncio.to_thread(
+                            extract_video_metadata,
+                            original,
+                            asset.file_modified_at or asset.created_at,
+                        )
+                        for field, value in metadata.items():
+                            setattr(asset, field, value)
+                        asset.processing_status = "complete"
+                    elif not asset.mime_type.startswith("image/"):
+                        asset.taken_at = asset.file_modified_at or asset.created_at
+                        asset.processing_status = "complete"
+                    else:
+                        if asset.encryption_version:
+                            if user is None:
+                                raise ValueError("Encrypted asset is missing its owning account")
+                            thumbnail = settings.staging_path / f"{asset.id}.{uuid.uuid4().hex}.thumbnail.webp"
+                        else:
+                            thumbnail = settings.derivatives_path / "thumbnails" / asset.checksum[:2] / f"{asset.checksum}.webp"
+                        metadata = await asyncio.to_thread(
+                            extract_and_thumbnail,
+                            original,
+                            thumbnail,
+                            asset.file_modified_at or asset.created_at,
+                        )
+                        if asset.encryption_version:
+                            encrypted_thumbnail = derivative_path_for("thumbnails", asset.checksum, asset.user_id)
+                            commit_encrypted_derivative(thumbnail, encrypted_thumbnail, user_media_key(user))
+                            metadata["thumbnail_path"] = str(encrypted_thumbnail)
+                        for field, value in metadata.items():
+                            setattr(asset, field, value)
+                        asset.processing_status = "complete"
                 await session.commit()
                 try:
                     index_asset_task.delay(str(asset.id))
@@ -251,8 +290,9 @@ async def index_asset(asset_id: uuid.UUID) -> None:
             asset.intelligence_status = "indexing"
             await session.commit()
             try:
-                original = Path(asset.original_path)
-                ocr_text = await asyncio.to_thread(extract_ocr, original, asset.mime_type)
+                user = await session.get(User, asset.user_id) if asset.encryption_version else None
+                with plaintext_asset_file(asset, user) as original:
+                    ocr_text = await asyncio.to_thread(extract_ocr, original, asset.mime_type)
                 parts = [
                     asset.original_filename or "", asset.relative_path or "", asset.mime_type,
                     asset.camera_make or "", asset.camera_model or "", asset.lens_model or "",
@@ -329,6 +369,8 @@ async def scan_external_library(library_id: uuid.UUID) -> None:
                             user_id=library.user_id,
                             original_path=str(path),
                             checksum=checksum,
+                            storage_checksum=checksum,
+                            encryption_version=0,
                             file_size=size,
                             mime_type=mime_type,
                             processing_status="pending",
@@ -398,10 +440,14 @@ async def protect_asset(asset_id: uuid.UUID) -> None:
                 if asset.storage_source == "external"
                 else validated_storage_path(asset.original_path, settings.originals_path)
             )
-            destination = settings.replica_path / asset.checksum[:2] / asset.checksum
+            destination = (
+                settings.replica_path / str(asset.user_id) / asset.checksum[:2] / asset.checksum
+                if asset.encryption_version
+                else settings.replica_path / asset.checksum[:2] / asset.checksum
+            )
             try:
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                if destination.exists() and await asyncio.to_thread(sha256_file, destination) != asset.checksum:
+                if destination.exists() and await asyncio.to_thread(sha256_file, destination) != asset.storage_checksum:
                     destination.unlink()
                 if not destination.exists():
                     temporary_copy = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.protect")
@@ -411,13 +457,15 @@ async def protect_asset(asset_id: uuid.UUID) -> None:
                         os.fsync(output_file.fileno())
                     os.replace(temporary_copy, destination)
                 replica_checksum = await asyncio.to_thread(sha256_file, destination)
-                if replica_checksum != asset.checksum:
+                if replica_checksum != asset.storage_checksum:
                     raise ValueError("Replica checksum verification failed")
                 metadata_path = destination.with_name(f"{destination.name}.metadata.json")
                 metadata_document = {
                     "schema": 1,
                     "asset_id": str(asset.id),
                     "checksum": asset.checksum,
+                    "storage_checksum": asset.storage_checksum,
+                    "encryption_version": asset.encryption_version,
                     "original_filename": asset.original_filename,
                     "relative_path": asset.relative_path,
                     "mime_type": asset.mime_type,
@@ -436,6 +484,8 @@ async def protect_asset(asset_id: uuid.UUID) -> None:
                 temporary_metadata = metadata_path.with_suffix(".json.tmp")
                 temporary_metadata.write_text(json.dumps(metadata_document, ensure_ascii=False, indent=2), encoding="utf-8")
                 os.replace(temporary_metadata, metadata_path)
+                stale_replica_path: Path | None = None
+                stale_metadata_path: Path | None = None
                 replica = await session.scalar(select(AssetReplica).where(AssetReplica.asset_id == asset.id))
                 if replica is None:
                     session.add(
@@ -448,11 +498,30 @@ async def protect_asset(asset_id: uuid.UUID) -> None:
                         )
                     )
                 else:
+                    previous_path = Path(replica.path)
+                    previous_metadata_path = Path(replica.metadata_path) if replica.metadata_path else None
                     replica.status = "verified"
+                    replica.path = str(destination)
+                    replica.checksum = replica_checksum
                     replica.metadata_path = str(metadata_path)
                     replica.verified_at = datetime.now(timezone.utc)
+                    # Legacy protection copies may be plaintext. Remove one
+                    # only after the encrypted destination is checksum-verified
+                    # and its database record now points to that destination.
+                    if previous_path != destination:
+                        stale_replica_path = previous_path
+                        stale_metadata_path = previous_metadata_path
                 asset.protection_status = "protected"
                 await session.commit()
+                if stale_replica_path:
+                    try:
+                        validated_storage_path(str(stale_replica_path), settings.replica_path).unlink(missing_ok=True)
+                        if stale_metadata_path:
+                            validated_storage_path(str(stale_metadata_path), settings.replica_path).unlink(missing_ok=True)
+                    except Exception:
+                        # The replacement is already sound; a later hygiene
+                        # pass can remove an inaccessible stale file.
+                        pass
             except Exception:
                 await session.rollback()
                 asset = await session.get(Asset, asset_id)
@@ -488,16 +557,20 @@ async def restore_asset(asset_id: uuid.UUID) -> None:
             await session.commit()
             try:
                 source = validated_storage_path(replica.path, settings.replica_path)
-                if await asyncio.to_thread(sha256_file, source) != asset.checksum:
+                if await asyncio.to_thread(sha256_file, source) != asset.storage_checksum:
                     raise ValueError("Protection copy failed checksum verification")
-                destination = original_path_for(asset.checksum, asset.original_filename)
+                destination = original_path_for(
+                    asset.checksum,
+                    asset.original_filename,
+                    asset.user_id if asset.encryption_version else None,
+                )
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.restore")
                 with source.open("rb") as input_file, temporary.open("xb") as output_file:
                     shutil.copyfileobj(input_file, output_file, length=4 * 1024 * 1024)
                     output_file.flush()
                     os.fsync(output_file.fileno())
-                if await asyncio.to_thread(sha256_file, temporary) != asset.checksum:
+                if await asyncio.to_thread(sha256_file, temporary) != asset.storage_checksum:
                     raise ValueError("Restored original failed checksum verification")
                 os.replace(temporary, destination)
                 timestamp = asset.file_modified_at or asset.taken_at
@@ -535,8 +608,8 @@ async def monitor_storage() -> None:
             for asset in assets:
                 original = Path(asset.original_path)
                 replica = await session.scalar(select(AssetReplica).where(AssetReplica.asset_id == asset.id))
-                original_ok = original.is_file() and await asyncio.to_thread(sha256_file, original) == asset.checksum
-                replica_ok = bool(replica and Path(replica.path).is_file() and await asyncio.to_thread(sha256_file, Path(replica.path)) == asset.checksum)
+                original_ok = original.is_file() and await asyncio.to_thread(sha256_file, original) == asset.storage_checksum
+                replica_ok = bool(replica and Path(replica.path).is_file() and await asyncio.to_thread(sha256_file, Path(replica.path)) == asset.storage_checksum)
                 if not original_ok and replica_ok and asset.storage_source == "managed":
                     already_open = await session.scalar(select(MonitoringEvent).where(
                         MonitoringEvent.asset_id == asset.id,
@@ -548,6 +621,13 @@ async def monitor_storage() -> None:
                             user_id=asset.user_id, asset_id=asset.id, kind="automatic_restore",
                             severity="warning", message="Original was missing; restore queued from verified protection copy.",
                         ))
+                        await notify_user_devices(
+                            session,
+                            asset.user_id,
+                            title="Storage recovery started",
+                            body="Drivebound is restoring a missing original from its verified protection copy.",
+                            data={"kind": "storage_warning", "asset_id": str(asset.id)},
+                        )
                         restore_asset_task.delay(str(asset.id))
                 elif original_ok and not replica_ok and settings.auto_protect_uploads:
                     asset.protection_status = "pending"
@@ -567,3 +647,86 @@ async def monitor_storage() -> None:
 @celery_app.task(name="monitor_storage")
 def monitor_storage_task() -> None:
     asyncio.run(monitor_storage())
+
+
+async def migrate_legacy_media(limit: int = 10) -> int:
+    """Move a bounded batch of legacy managed media into per-user encryption.
+
+    This is deliberately opt-in through ``MEDIA_ENCRYPTION_MIGRATE_LEGACY``.
+    It leaves a plaintext shared object in place until no legacy asset still
+    references it, and re-queues an encrypted protection copy afterwards.
+    """
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    migrated = 0
+    try:
+        async with session_factory() as session:
+            assets = list((await session.scalars(
+                select(Asset)
+                .where(Asset.encryption_version == 0, Asset.storage_source == "managed")
+                .order_by(Asset.created_at)
+                .limit(limit)
+            )).all())
+            for asset in assets:
+                source = validated_storage_path(asset.original_path, settings.originals_path)
+                if not source.is_file():
+                    continue
+                user = await session.get(User, asset.user_id)
+                if user is None:
+                    continue
+                destination = original_path_for(asset.checksum, asset.original_filename, asset.user_id)
+                try:
+                    if not destination.exists():
+                        await asyncio.to_thread(encrypt_file, source, destination, user_media_key(user))
+                    encrypted_thumbnail: Path | None = None
+                    old_thumbnail = Path(asset.thumbnail_path) if asset.thumbnail_path else None
+                    if old_thumbnail and old_thumbnail.is_file():
+                        encrypted_thumbnail = derivative_path_for("thumbnails", asset.checksum, asset.user_id)
+                        if not encrypted_thumbnail.exists():
+                            await asyncio.to_thread(encrypt_file, old_thumbnail, encrypted_thumbnail, user_media_key(user))
+                    remaining_originals = await session.scalar(
+                        select(Asset.id)
+                        .where(
+                            Asset.original_path == asset.original_path,
+                            Asset.encryption_version == 0,
+                            Asset.id != asset.id,
+                        )
+                        .limit(1)
+                    )
+                    remaining_thumbnails = await session.scalar(
+                        select(Asset.id)
+                        .where(
+                            Asset.thumbnail_path == asset.thumbnail_path,
+                            Asset.encryption_version == 0,
+                            Asset.id != asset.id,
+                        )
+                        .limit(1)
+                    ) if old_thumbnail else None
+                    asset.original_path = str(destination)
+                    asset.storage_checksum = await asyncio.to_thread(sha256_file, destination)
+                    asset.encryption_version = 1
+                    if encrypted_thumbnail:
+                        asset.thumbnail_path = str(encrypted_thumbnail)
+                    asset.protection_status = "unprotected"
+                    await session.commit()
+                    if remaining_originals is None:
+                        source.unlink(missing_ok=True)
+                    if old_thumbnail and remaining_thumbnails is None:
+                        old_thumbnail.unlink(missing_ok=True)
+                    try:
+                        protect_asset_task.delay(str(asset.id))
+                    except Exception:
+                        asset.protection_status = "failed"
+                        await session.commit()
+                    migrated += 1
+                except Exception:
+                    await session.rollback()
+                    raise
+    finally:
+        await engine.dispose()
+    return migrated
+
+
+@celery_app.task(name="migrate_legacy_media", autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
+def migrate_legacy_media_task(limit: int = 10) -> int:
+    return asyncio.run(migrate_legacy_media(limit))

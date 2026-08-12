@@ -1,0 +1,28 @@
+name: Release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target validation environment
+        required: true
+        type: choice
+        options: [staging, production]
+  push:
+    tags: ['v*']
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image
+        run: docker build -t drivebound-backend:${{ github.sha }} backend
+      - name: Build frontend image
+        run: docker build -t drivebound-frontend:${{ github.sha }} frontend
+      - name: Export deployment manifests
+        run: tar -czf drivebound-deployment-${{ github.sha }}.tgz docker-compose.yml docker-compose.production.yml docs/operations
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drivebound-deployment-${{ github.sha }}
+          path: drivebound-deployment-${{ github.sha }}.tgz

@@ -10,7 +10,7 @@ Drivebound is an expandable personal cloud backed by drives you own. It provides
 4. Run `docker compose up --build -d`.
 5. Open <http://localhost:3000>, create an account, and complete setup.
 
-The backend applies Alembic migrations through `0011` before starting. Confirm the current migration with:
+The backend applies Alembic migrations through `0013` before starting. Confirm the current migration with:
 
 ```text
 docker compose exec backend alembic current
@@ -61,6 +61,8 @@ Originals are checksum-addressed and created without overwriting an existing pat
 
 New uploads and imported media are automatically copied to the protection drive. Each replica is SHA-256 verified and receives a JSON metadata sidecar containing original names, paths, filesystem dates, capture time, GPS, camera/lens information, and embedded EXIF or container metadata. Restores verify the replica again, atomically replace the managed original, and reapply the preserved modification time.
 
+Managed uploads and generated thumbnails are encrypted at rest with an account-specific AES-256-GCM key. The deployment master key wraps each account key and must come from a file-backed secret in staging and production. This deliberately preserves local preview, OCR, and future face processing; it is not a zero-knowledge mode. Set `MEDIA_ENCRYPTION_MIGRATE_LEGACY=true` only after taking a verified backup to migrate pre-encryption managed media in bounded background batches.
+
 For real drive-failure protection, mount `/data/replicas` from a second physical drive. Keeping originals and replicas on the same disk verifies the workflow but does not protect against physical disk failure.
 
 ## Browser upload
@@ -105,7 +107,7 @@ Obtain a token from `POST /api/v1/auth/token`, using the account email as the OA
 
 The native Expo client lives in `mobile`. Install its packages with `npm install`, then use `npx expo run:android` or `npx expo run:ios`. Connect with the same Drivebound account used on the web. On a physical phone, enter the computer's LAN or HTTPS API address rather than `localhost`.
 
-Each installation receives a separate revocable device credential. Camera-roll uploads resume in chunks and preserve the untouched bytes, filename, filesystem dates, capture time, EXIF, GPS, and video-container metadata. The operating system schedules automatic backups; a native development/release build is required because background tasks do not run in Expo Go.
+Each installation receives a separate revocable device credential. Camera-roll uploads resume in a durable SQLite transfer queue and preserve the untouched bytes, filename, filesystem dates, capture time, EXIF, GPS, and video-container metadata. The app includes library browsing, search, albums, memories, location discovery, sharing, video playback, original restore-to-phone, Wi-Fi/charging/bandwidth/schedule controls, and notification registration. The operating system schedules automatic backups; a native development/release build is required because background tasks do not run in Expo Go.
 
 ## Search intelligence and recovery
 
@@ -132,11 +134,12 @@ The Docker ports bind to loopback by default. Put Drivebound behind a trusted HT
 ## Current product status
 
 - **Account access:** registration, login, HTTP-only sessions, logout, onboarding, and mandatory owner filtering are implemented.
-- **Mobile backup:** a native Expo camera-roll client, revocable device tokens, resumable transfers, durable local progress, and OS-scheduled background backup are implemented.
+- **Mobile experience:** a native Expo library, discovery, sharing, restore, SQLite-backed resumable transfer queue, policy controls, local/Expo push notifications, and OS-scheduled background backup are implemented.
 - **Protection:** automatic verified copies, metadata sidecars, bulk protection status, and checksum-verified restore are implemented under `/data/replicas`.
 - **Private sharing:** opaque, hashed, expiring links and optional Argon2 password protection are implemented.
 - **Organization:** Files, collaborative Albums, OCR/semantic Search, Memories, and GPS Map screens are connected to permission-scoped APIs.
 - **Operations:** scheduled integrity monitoring, automatic original/replica repair, health events, and hosted node pairing are implemented.
+- **Production foundation:** hybrid deployment configuration, file-backed production secrets, account-scoped media encryption, structured request logging, Prometheus metrics, and CI/release-candidate workflows are implemented.
 - **Interface:** registration, onboarding, library, storage, uploads, viewer, and public sharing use the centralized neumorphic design system.
 
 ## Storage health scope

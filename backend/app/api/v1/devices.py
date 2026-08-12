@@ -11,7 +11,8 @@ from app.db.session import get_db
 from app.models.asset import Asset
 from app.models.device import Device
 from app.models.user import User
-from app.schemas.device import BackupStatus, DeviceCreate, DeviceRegistration, DeviceResponse
+from app.schemas.device import BackupEventNotification, BackupStatus, DeviceCreate, DevicePushTokenUpdate, DeviceRegistration, DeviceResponse
+from app.services.notifications import send_device_notification
 
 router = APIRouter(prefix="/devices", tags=["devices"])
 
@@ -76,3 +77,37 @@ async def backup_status(
     asset = await session.scalar(select(Asset).where(Asset.user_id == device.user_id, Asset.checksum == checksum))
     await session.commit()
     return BackupStatus(exists=asset is not None, asset_id=asset.id if asset else None)
+
+
+@router.put("/push-token", status_code=status.HTTP_204_NO_CONTENT)
+async def update_push_token(
+    payload: DevicePushTokenUpdate,
+    x_device_token: str | None = Header(default=None),
+    session: AsyncSession = Depends(get_db),
+) -> None:
+    device = await authenticated_device(session, x_device_token)
+    if payload.token:
+        previous = await session.scalar(select(Device).where(Device.push_token == payload.token, Device.id != device.id))
+        if previous is not None:
+            previous.push_token = None
+            previous.push_token_updated_at = None
+    device.push_token = payload.token
+    device.push_token_updated_at = datetime.now(timezone.utc) if payload.token else None
+    await session.commit()
+
+
+@router.post("/backup-events", status_code=status.HTTP_202_ACCEPTED)
+async def backup_event(
+    payload: BackupEventNotification,
+    x_device_token: str | None = Header(default=None),
+    session: AsyncSession = Depends(get_db),
+) -> None:
+    device = await authenticated_device(session, x_device_token)
+    if payload.kind == "completed":
+        title = "Backup complete"
+        body = f"{payload.uploaded} uploaded, {payload.skipped} already protected."
+    else:
+        title = "Backup needs attention"
+        body = payload.detail or "Drivebound could not finish the latest backup."
+    await send_device_notification(session, device, title=title, body=body, data={"kind": payload.kind})
+    await session.commit()
