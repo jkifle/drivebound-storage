@@ -5,6 +5,7 @@ import {
   ChangeEvent,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -77,7 +78,60 @@ type StorageStatus = {
 
 type ProtectionStatus = { total: number; protected: number; queued: number; unprotected: number; failed: number };
 type MonitoringOverview = { open_events: number; failed_assets: number; unprotected_assets: number };
-type PairedNode = { id: string; name: string; status: string; last_seen_at: string | null };
+type NodeInventoryItem = {
+  name: string;
+  type: "directory" | "file";
+  path?: string;
+  children_count?: number;
+};
+
+type NodeMount = {
+  root: string;
+  available: boolean;
+  total_bytes?: number;
+  used_bytes?: number;
+  free_bytes?: number;
+  reason?: string;
+  inventory?: {
+    root: string;
+    available: boolean;
+    total_items?: number;
+    truncated?: boolean;
+    error?: string;
+    items?: NodeInventoryItem[];
+  };
+};
+
+type NodeDirectoryEntry = {
+  name: string;
+  path: string;
+  type: "directory" | "file";
+  size?: number | null;
+};
+
+type NodeDirectoryListing = {
+  path: string;
+  exists: boolean;
+  is_dir?: boolean;
+  root?: string;
+  items?: NodeDirectoryEntry[];
+  total_items?: number;
+  truncated?: boolean;
+  error?: string;
+};
+
+type PairedNode = {
+  id: string;
+  name: string;
+  status: string;
+  last_seen_at: string | null;
+  capabilities?: {
+    storage?: boolean;
+    backup?: boolean;
+    service_version?: string;
+    mounts?: NodeMount[];
+  } | null;
+};
 
 type ExternalLibrary = {
   id: string;
@@ -92,6 +146,48 @@ type ExternalLibrary = {
 type TimelineRow =
   | { kind: "heading"; day: string; id: string }
   | { kind: "photos"; assets: TimelineAsset[]; id: string };
+
+function DirectoryPathField({ value, onChange }: { value: string; onChange: (next: string) => void }) {
+  const pickerId = useId();
+  const [pickerKey, setPickerKey] = useState(0);
+
+  const handleSelect = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const relative = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+    const folder = relative ? relative.split("/").slice(0, -1).join("/") : file.name;
+    onChange(folder || value || "/data/imports");
+    setPickerKey((current) => current + 1);
+  };
+
+  return (
+    <>
+      <div className="folder-input-wrap">
+        <input value={value} onChange={(event) => onChange(event.target.value)} aria-label="Media folder path" />
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={() => {
+            const input = document.getElementById(pickerId) as HTMLInputElement | null;
+            if (input) input.click();
+          }}
+        >
+          Choose folder
+        </button>
+      </div>
+      <input
+        key={pickerKey}
+        id={pickerId}
+        type="file"
+        hidden
+        webkitdirectory="true"
+        directory="true"
+        multiple={false}
+        onChange={handleSelect}
+      />
+    </>
+  );
+}
 
 function apiUrl(path: string) {
   return path.startsWith("http") ? path : `${API_URL}${path}`;
@@ -438,6 +534,7 @@ function StoragePanel({ onClose, onLibraryChanged }: { onClose: () => void; onLi
   const [monitoring, setMonitoring] = useState<MonitoringOverview | null>(null);
   const [nodes, setNodes] = useState<PairedNode[]>([]);
   const [pairingCode, setPairingCode] = useState<string | null>(null);
+  const [nodeBrowse, setNodeBrowse] = useState<Record<string, NodeDirectoryListing>>({});
 
   const refresh = useCallback(async () => {
     const [storageResponse, libraryResponse, protectionResponse, monitoringResponse, nodesResponse] = await Promise.all([
@@ -506,6 +603,15 @@ function StoragePanel({ onClose, onLibraryChanged }: { onClose: () => void; onLi
   const runHealthCheck = async () => { await apiFetch("/api/v1/monitoring/run", { method: "POST" }); setMessage("A full storage health check is running."); };
   const createPairingCode = async () => { const response = await apiFetch("/api/v1/nodes/pairing-code", { method: "POST" }); if (response.ok) setPairingCode((await response.json()).code); };
   const reindexIntelligence = async () => { const response = await apiFetch("/api/v1/intelligence/reindex", { method: "POST" }); const result = await response.json().catch(() => null); setMessage(response.ok ? `${result.queued} files queued for OCR and semantic search.` : "Search indexing could not be queued."); };
+  const browseNode = async (node: PairedNode, path = "") => {
+    const response = await apiFetch(`/api/v1/nodes/${node.id}/browse?path=${encodeURIComponent(path)}`);
+    if (!response.ok) {
+      setMessage(`Could not browse ${node.name}.`);
+      return;
+    }
+    const listing = await response.json();
+    setNodeBrowse((current) => ({ ...current, [node.id]: listing }));
+  };
 
   return (
     <div className="storage-scrim" role="dialog" aria-modal="true" aria-labelledby="storage-title">
@@ -543,7 +649,81 @@ function StoragePanel({ onClose, onLibraryChanged }: { onClose: () => void; onLi
           {monitoring && <p className="health-note">{monitoring.open_events ? `${monitoring.open_events} issue(s) are being monitored or repaired.` : "Automated recovery is watching your originals and protection copies."}</p>}
         </section>
 
-        <section className="storage-section"><div className="section-title"><h3>Paired storage nodes</h3><span>{nodes.length}</span></div>{nodes.map(node => <article className="library-card" key={node.id}><div><strong>{node.name}</strong><span>{node.status}</span><small>{node.last_seen_at ? `Last seen ${new Date(node.last_seen_at).toLocaleString()}` : "Waiting for first heartbeat"}</small></div></article>)}<div className="library-form"><button onClick={() => void createPairingCode()}>Pair another drive</button>{pairingCode && <p>Enter code <code>{pairingCode}</code> on the storage node within 10 minutes.</p>}</div></section>
+        <section className="storage-section">
+          <div className="section-title"><h3>Paired storage nodes</h3><span>{nodes.length}</span></div>
+          {nodes.length === 0 ? <p className="health-note">No external storage nodes are paired yet. Generate a code below and run the Drivebound node service on the target desktop.</p> : null}
+          {nodes.map((node) => {
+            const browse = nodeBrowse[node.id];
+            return (
+              <article className="library-card" key={node.id}>
+                <div>
+                  <strong>{node.name}</strong>
+                  <span>{node.status}</span>
+                  <small>{node.last_seen_at ? `Last seen ${new Date(node.last_seen_at).toLocaleString()}` : "Waiting for first heartbeat"}</small>
+                </div>
+                {node.capabilities?.mounts?.length ? (
+                  <div className="storage-node-mounts">
+                    {node.capabilities.mounts.map((mount) => (
+                      <div key={`${node.id}-${mount.root}`} className="storage-node-mount">
+                        <div className="storage-node-mount-header">
+                          <strong>{mount.root}</strong>
+                          <span>{mount.available ? `${formatBytes(mount.free_bytes)} free` : "Unavailable"}</span>
+                        </div>
+                        {mount.inventory && mount.inventory.available ? (
+                          <ul className="storage-node-items">
+                            {mount.inventory.items?.slice(0, 5).map((item) => (
+                              <li key={`${mount.root}-${item.path ?? item.name}`}>
+                                <span className={item.type === "directory" ? "item-directory" : "item-file"}>{item.type === "directory" ? "▣" : "▤"}</span>
+                                <span>{item.name}</span>
+                                {item.children_count != null && item.children_count > 0 ? <small>{item.children_count} items</small> : null}
+                              </li>
+                            ))}
+                            {mount.inventory.truncated ? <li className="storage-node-more">… more items available</li> : null}
+                          </ul>
+                        ) : (
+                          <small>{mount.reason ?? mount.inventory?.error ?? "No readable storage inventory yet."}</small>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <small>No storage roots reported yet. The node will publish detected drives after it connects.</small>
+                )}
+                {node.endpoint_url ? (
+                  <div className="storage-node-browse">
+                    <button onClick={() => void browseNode(node)}>Browse storage</button>
+                    {browse && browse.is_dir && browse.items && (
+                      <div className="storage-node-browse-list">
+                        <div className="storage-node-browse-path"><strong>{browse.path}</strong></div>
+                        <ul>
+                          {browse.items.slice(0, 10).map((item) => (
+                            <li key={item.path}>
+                              <button type="button" onClick={() => item.type === "directory" ? void browseNode(node, item.path) : undefined}>
+                                {item.type === "directory" ? "▣" : "▤"} {item.name}
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <small>Run the node service with an advertised endpoint URL to expose the storage browser.</small>
+                )}
+              </article>
+            );
+          })}
+          <div className="library-form">
+            <button onClick={() => void createPairingCode()}>Generate pairing code</button>
+            {pairingCode ? (
+              <p>
+                Enter code <code>{pairingCode}</code> on the storage node within 10 minutes. Then run the node service on the target computer and it will appear here automatically.
+              </p>
+            ) : (
+              <p>Run the Drivebound node service on the host desktop, then enter the generated value to pair that drive.</p>
+            )}
+          </div>
+        </section>
 
         <section className="storage-section">
           <div className="section-title"><h3>Read-only libraries</h3><span>{libraries.length}</span></div>
@@ -556,9 +736,9 @@ function StoragePanel({ onClose, onLibraryChanged }: { onClose: () => void; onLi
           ))}
           <div className="library-form">
             <label>Name<input value={name} onChange={(event) => setName(event.target.value)} /></label>
-            <label>Container path<input value={path} onChange={(event) => setPath(event.target.value)} /></label>
+            <label>Container path<DirectoryPathField value={path} onChange={setPath} /></label>
             <button onClick={() => void addLibrary()} disabled={saving || !name.trim() || !path.trim()}>{saving ? "Adding…" : "Add and scan"}</button>
-            <p>Place existing media in <code>data/imports</code>, or mount another read-only folder at <code>/data/imports</code>.</p>
+            <p>Choose a folder from your machine, or type a mounted path like <code>/data/imports</code> if you already know it.</p>
           </div>
           {message && <p className="storage-message" aria-live="polite">{message}</p>}
         </section>

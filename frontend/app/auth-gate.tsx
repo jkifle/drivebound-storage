@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState, type ChangeEvent } from "react";
 import { apiRequest } from "./api-client";
 import { PhotoLibrary } from "./photo-library";
 
@@ -15,6 +15,40 @@ export type DriveboundUser = {
 
 function Brand() {
   return <div className="brand"><span className="brand-mark" aria-hidden="true">D</span><span>Drivebound</span></div>;
+}
+
+function DirectoryPathField({ value, onChange }: { value: string; onChange: (next: string) => void }) {
+  const pickerId = useId();
+  const [pickerKey, setPickerKey] = useState(0);
+
+  const handleSelect = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const relative = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+    const folder = relative ? relative.split("/").slice(0, -1).join("/") : file.name;
+    onChange(folder || value || "/data/imports");
+    setPickerKey((current) => current + 1);
+  };
+
+  return <>
+    <div className="folder-input-wrap">
+      <input value={value} onChange={(event) => onChange(event.target.value)} aria-label="Media folder path" />
+      <button type="button" className="secondary-button" onClick={() => {
+        const input = document.getElementById(pickerId) as HTMLInputElement | null;
+        if (input) input.click();
+      }}>Choose folder</button>
+    </div>
+    <input
+      key={pickerKey}
+      id={pickerId}
+      type="file"
+      hidden
+      webkitdirectory="true"
+      directory="true"
+      multiple={false}
+      onChange={handleSelect}
+    />
+  </>;
 }
 
 function Onboarding({ user, onComplete }: { user: DriveboundUser; onComplete: (user: DriveboundUser) => void }) {
@@ -50,7 +84,7 @@ function Onboarding({ user, onComplete }: { user: DriveboundUser; onComplete: (u
     <section className="onboarding-card">
       <div className="step-track" aria-label={`Step ${step} of 3`}><span style={{ width: `${step * 33.333}%` }} /></div>
       {step === 1 && <><div className="step-icon">01</div><span className="eyebrow">Make it yours</span><h1>Welcome to Drivebound.</h1><p>This name appears on your private library and connected devices.</p><label>Your name<input value={name} onChange={(e) => setName(e.target.value)} /></label><button className="primary-button" disabled={!name.trim()} onClick={() => setStep(2)}>Continue</button></>}
-      {step === 2 && <><div className="step-icon">02</div><span className="eyebrow">Connect storage</span><h1>Bring your first drive online.</h1><p>Drivebound indexes this folder without moving or modifying the originals.</p><label>Drive name<input value={libraryName} onChange={(e) => setLibraryName(e.target.value)} /></label><label>Media folder<input value={path} onChange={(e) => setPath(e.target.value)} /><small>The default maps to the project&apos;s data/imports folder.</small></label>{message && <p className="form-error">{message}</p>}<div className="button-row"><button className="secondary-button" onClick={() => setStep(3)}>Do this later</button><button className="primary-button" disabled={busy} onClick={() => void connectDrive()}>{busy ? "Connectingâ€¦" : "Connect drive"}</button></div></>}
+      {step === 2 && <><div className="step-icon">02</div><span className="eyebrow">Connect storage</span><h1>Bring your first drive online.</h1><p>Drivebound indexes this folder without moving or modifying the originals.</p><label>Drive name<input value={libraryName} onChange={(e) => setLibraryName(e.target.value)} /></label><label>Media folder<DirectoryPathField value={path} onChange={setPath} /></label>{message && <p className="form-error">{message}</p>}<div className="button-row"><button className="secondary-button" onClick={() => setStep(3)}>Do this later</button><button className="primary-button" disabled={busy} onClick={() => void connectDrive()}>{busy ? "Connectingâ€¦" : "Connect drive"}</button></div></>}
       {step === 3 && <><div className="step-icon success">âœ“</div><span className="eyebrow">Ready to grow</span><h1>Your private cloud is ready.</h1><p>Add photos now, then mount <strong>/data/replicas</strong> on a second physical drive for verified protection.</p>{message && <p className="form-error">{message}</p>}<button className="primary-button" disabled={busy} onClick={() => void finish()}>{busy ? "Openingâ€¦" : "Open my library"}</button></>}
     </section>
   </main>;
