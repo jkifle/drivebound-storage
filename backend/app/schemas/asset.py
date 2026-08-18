@@ -9,6 +9,12 @@ class AssetResponse(BaseModel):
 
     id: uuid.UUID
     user_id: uuid.UUID
+    logical_id: uuid.UUID
+    version: int
+    lifecycle_state: str
+    superseded_at: datetime | None
+    trashed_at: datetime | None
+    purge_after: datetime | None
     checksum: str
     encryption_version: int
     file_size: int
@@ -35,6 +41,7 @@ class AssetResponse(BaseModel):
     protection_status: str
     restore_status: str
     restored_at: datetime | None
+    perceptual_hash: str | None
     created_at: datetime
 
 

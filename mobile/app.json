@@ -19,9 +19,13 @@
       [
         "expo-media-library",
         {
-          "photosPermission": "Drivebound needs photo access to back up your library.",
-          "savePhotosPermission": "Drivebound can restore media to your library.",
-          "isAccessMediaLocationEnabled": true
+          "photosPermission": "Drivebound reads the photos and videos you choose so it can back up the original files to your Drivebound server.",
+          "savePhotosPermission": "Drivebound adds an original photo or video to your library only when you choose Save original.",
+          "isAccessMediaLocationEnabled": true,
+          "granularPermissions": [
+            "photo",
+            "video"
+          ]
         }
       ]
     ],
@@ -30,26 +34,28 @@
       "bundleIdentifier": "com.jkifle.driveboundbackup",
       "buildNumber": "1",
       "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "Drivebound reads the photos and videos you choose so it can back up the original files to your Drivebound server.",
+        "NSPhotoLibraryAddUsageDescription": "Drivebound adds an original photo or video to your library only when you choose Save original.",
+        "NSLocalNetworkUsageDescription": "Drivebound connects to the Drivebound server you select on your local network.",
         "UIBackgroundModes": [
           "processing",
           "remote-notification"
         ],
-        "NSAppTransportSecurity": {
-          "NSAllowsLocalNetworking": true
-        }
+        "BGTaskSchedulerPermittedIdentifiers": [
+          "com.expo.modules.backgroundtask.processing"
+        ]
+      },
+      "config": {
+        "usesNonExemptEncryption": false
       }
     },
     "android": {
-      "usesCleartextTraffic": true,
+      "usesCleartextTraffic": false,
       "permissions": [
-        "READ_MEDIA_IMAGES",
-        "READ_MEDIA_VIDEO",
-        "android.permission.READ_EXTERNAL_STORAGE",
-        "android.permission.WRITE_EXTERNAL_STORAGE",
-        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
-        "android.permission.ACCESS_MEDIA_LOCATION",
-        "android.permission.READ_MEDIA_IMAGES",
-        "android.permission.READ_MEDIA_VIDEO"
+        "android.permission.ACCESS_MEDIA_LOCATION"
+      ],
+      "blockedPermissions": [
+        "android.permission.READ_MEDIA_AUDIO"
       ],
       "package": "com.jkifle.driveboundbackup",
       "versionCode": 1

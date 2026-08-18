@@ -39,11 +39,19 @@ services:
       DERIVATIVES_PATH: /data/derivatives
       STAGING_PATH: /data/staging
       REPLICA_PATH: /data/replicas
+      REPLICA_ROOTS: ${REPLICA_ROOTS:-/data/replicas}
+      BACKUPS_PATH: /data/backups
+      DATABASE_BACKUP_ENABLED: ${DATABASE_BACKUP_ENABLED:-true}
+      DATABASE_BACKUP_INTERVAL_HOURS: ${DATABASE_BACKUP_INTERVAL_HOURS:-24}
+      DATABASE_BACKUP_RETENTION_DAYS: ${DATABASE_BACKUP_RETENTION_DAYS:-30}
+      LIFECYCLE_RETENTION_DAYS: ${LIFECYCLE_RETENTION_DAYS:-30}
       AUTO_PROTECT_UPLOADS: ${AUTO_PROTECT_UPLOADS:-true}
       APP_URL: ${APP_URL:-http://localhost:3000}
       API_URL: ${API_URL:-http://localhost:8000}
       JWT_SECRET: ${JWT_SECRET:-change-this-before-enabling-remote-access}
+      AUTH_COOKIE_NAME: ${AUTH_COOKIE_NAME:-drivebound_session}
       AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      REFRESH_COOKIE_NAME: ${REFRESH_COOKIE_NAME:-drivebound_refresh}
       ACCESS_TOKEN_MINUTES: ${ACCESS_TOKEN_MINUTES:-15}
       REFRESH_SESSION_DAYS: ${REFRESH_SESSION_DAYS:-30}
       EMAIL_DELIVERY_MODE: ${EMAIL_DELIVERY_MODE:-console}
@@ -59,9 +67,15 @@ services:
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/api/v1/auth/google/callback}
+      WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID:-localhost}
+      WEBAUTHN_RP_NAME: ${WEBAUTHN_RP_NAME:-Drivebound}
+      WEBAUTHN_ORIGINS: ${WEBAUTHN_ORIGINS:-http://localhost:3000}
+      WEBAUTHN_CHALLENGE_MINUTES: ${WEBAUTHN_CHALLENGE_MINUTES:-5}
+      RECENT_AUTH_MINUTES: ${RECENT_AUTH_MINUTES:-10}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       REMOTE_ACCESS_ENABLED: ${REMOTE_ACCESS_ENABLED:-false}
       TRUSTED_HOSTS: ${TRUSTED_HOSTS:-localhost,127.0.0.1}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
       EXTERNAL_LIBRARY_ROOTS: ${EXTERNAL_LIBRARY_ROOTS:-/data/imports}
       SEMANTIC_ENABLED: ${SEMANTIC_ENABLED:-true}
       OCR_ENABLED: ${OCR_ENABLED:-true}
@@ -70,11 +84,13 @@ services:
       MEDIA_ENCRYPTION_MASTER_KEY: ${MEDIA_ENCRYPTION_MASTER_KEY:-RZAIpFM5CAciKTy4UABCTvvyD83LfeB9r_ZR4z0LnKQ=}
       MEDIA_ENCRYPTION_MIGRATE_LEGACY: ${MEDIA_ENCRYPTION_MIGRATE_LEGACY:-false}
       OBSERVABILITY_LOG_JSON: ${OBSERVABILITY_LOG_JSON:-false}
+      METRICS_AUTH_TOKEN: ${METRICS_AUTH_TOKEN:-}
     volumes:
       - ./data/originals:/data/originals
       - ./data/derivatives:/data/derivatives
       - ./data/staging:/data/staging
       - ./data/replicas:/data/replicas:ro
+      - ./data/backups:/data/backups
       - ./data/imports:/data/imports:ro
     ports:
       - "127.0.0.1:8000:8000"
@@ -103,6 +119,12 @@ services:
       DERIVATIVES_PATH: /data/derivatives
       STAGING_PATH: /data/staging
       REPLICA_PATH: /data/replicas
+      REPLICA_ROOTS: ${REPLICA_ROOTS:-/data/replicas}
+      BACKUPS_PATH: /data/backups
+      DATABASE_BACKUP_ENABLED: ${DATABASE_BACKUP_ENABLED:-true}
+      DATABASE_BACKUP_INTERVAL_HOURS: ${DATABASE_BACKUP_INTERVAL_HOURS:-24}
+      DATABASE_BACKUP_RETENTION_DAYS: ${DATABASE_BACKUP_RETENTION_DAYS:-30}
+      LIFECYCLE_RETENTION_DAYS: ${LIFECYCLE_RETENTION_DAYS:-30}
       AUTO_PROTECT_UPLOADS: ${AUTO_PROTECT_UPLOADS:-true}
       EXTERNAL_LIBRARY_ROOTS: ${EXTERNAL_LIBRARY_ROOTS:-/data/imports}
       SEMANTIC_ENABLED: ${SEMANTIC_ENABLED:-true}
@@ -114,6 +136,7 @@ services:
       - ./data/originals:/data/originals
       - ./data/derivatives:/data/derivatives
       - ./data/replicas:/data/replicas
+      - ./data/backups:/data/backups
       - ./data/imports:/data/imports:ro
       - model_cache:/data/models
     depends_on:
@@ -139,6 +162,12 @@ services:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       ORIGINALS_PATH: /data/originals
       REPLICA_PATH: /data/replicas
+      REPLICA_ROOTS: ${REPLICA_ROOTS:-/data/replicas}
+      BACKUPS_PATH: /data/backups
+      DATABASE_BACKUP_ENABLED: ${DATABASE_BACKUP_ENABLED:-true}
+      DATABASE_BACKUP_INTERVAL_HOURS: ${DATABASE_BACKUP_INTERVAL_HOURS:-24}
+      DATABASE_BACKUP_RETENTION_DAYS: ${DATABASE_BACKUP_RETENTION_DAYS:-30}
+      LIFECYCLE_RETENTION_DAYS: ${LIFECYCLE_RETENTION_DAYS:-30}
       EXTERNAL_LIBRARY_ROOTS: ${EXTERNAL_LIBRARY_ROOTS:-/data/imports}
       MONITOR_INTERVAL_SECONDS: ${MONITOR_INTERVAL_SECONDS:-900}
       MEDIA_ENCRYPTION_ENABLED: ${MEDIA_ENCRYPTION_ENABLED:-true}
@@ -147,6 +176,7 @@ services:
     volumes:
       - ./data/originals:/data/originals
       - ./data/replicas:/data/replicas
+      - ./data/backups:/data/backups
       - ./data/imports:/data/imports:ro
     depends_on:
       backend:

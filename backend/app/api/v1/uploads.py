@@ -72,7 +72,11 @@ async def create_upload(
         raise HTTPException(status_code=413, detail="Upload exceeds the configured size limit")
     if payload.checksum:
         existing = await session.scalar(
-            select(Asset).where(Asset.user_id == principal.user_id, Asset.checksum == payload.checksum)
+            select(Asset).where(
+                Asset.user_id == principal.user_id,
+                Asset.checksum == payload.checksum,
+                Asset.lifecycle_state == "active",
+            )
         )
         if existing is not None:
             placeholder = UploadSession(

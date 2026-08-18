@@ -17,6 +17,22 @@ services:
       JWT_SECRET_FILE: /run/secrets/jwt_secret
       MFA_ENCRYPTION_SECRET_FILE: /run/secrets/mfa_encryption_secret
       MEDIA_ENCRYPTION_MASTER_KEY_FILE: /run/secrets/media_encryption_master_key
+      METRICS_AUTH_TOKEN_FILE: /run/secrets/metrics_auth_token
+      AUTH_COOKIE_NAME: __Host-drivebound_session
+      REFRESH_COOKIE_NAME: __Host-drivebound_refresh
+      AUTH_COOKIE_SECURE: "true"
+      EMAIL_DELIVERY_MODE: smtp
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME}
+      SMTP_PASSWORD_FILE: /run/secrets/smtp_password
+      SMTP_FROM: ${SMTP_FROM}
+      SMTP_USE_TLS: "true"
+      WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID}
+      WEBAUTHN_RP_NAME: ${WEBAUTHN_RP_NAME:-Drivebound}
+      WEBAUTHN_ORIGINS: ${WEBAUTHN_ORIGINS}
+      WEBAUTHN_CHALLENGE_MINUTES: ${WEBAUTHN_CHALLENGE_MINUTES:-5}
+      RECENT_AUTH_MINUTES: ${RECENT_AUTH_MINUTES:-10}
       MEDIA_ENCRYPTION_ENABLED: "true"
       OBSERVABILITY_LOG_JSON: "true"
       REMOTE_ACCESS_ENABLED: "true"
@@ -26,6 +42,8 @@ services:
       - jwt_secret
       - mfa_encryption_secret
       - media_encryption_master_key
+      - metrics_auth_token
+      - smtp_password
   worker:
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-production}
@@ -63,3 +81,11 @@ secrets:
     file: ./.secrets/media_encryption_master_key
   postgres_password:
     file: ./.secrets/postgres_password
+  metrics_auth_token:
+    file: ./.secrets/metrics_auth_token
+  smtp_password:
+    file: ./.secrets/smtp_password
+  # Mount this on the backend and set GOOGLE_CLIENT_SECRET_FILE only when
+  # GOOGLE_CLIENT_ID is enabled. Keeping it unattached makes Google optional.
+  google_client_secret:
+    file: ./.secrets/google_client_secret

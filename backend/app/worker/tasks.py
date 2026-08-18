@@ -6,22 +6,26 @@ import re
 import shutil
 import subprocess
 import uuid
+from collections import Counter
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
 from typing import Iterator
 
 from PIL import ExifTags, Image, ImageOps
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy import func, select
 from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
+from app.core.observability import metrics
 from app.models.asset import Asset
 from app.models.external_library import ExternalLibrary
 from app.models.replica import AssetReplica
 from app.models.monitoring import MonitoringEvent
+from app.models.storage_policy import StorageDrive
 from app.models.user import User
 from app.services.ingestion import user_media_key
 from app.services.encryption import encrypt_file
@@ -34,7 +38,18 @@ from app.services.storage import (
     original_path_for,
     sha256_file,
     validated_external_path,
+    validated_replica_drive_path,
     validated_storage_path,
+)
+from app.services.replication import ensure_asset_replicas
+from app.services.replication import rebalance_replicas
+from app.services.media_groups import group_asset, perceptual_hash
+from app.services.lifecycle import purge_due_assets
+from app.services.operational_backups import (
+    create_configuration_backup,
+    create_database_backup,
+    prune_operational_backups,
+    verify_operational_backups,
 )
 from app.worker.celery_app import celery_app
 
@@ -107,6 +122,7 @@ def extract_and_thumbnail(original: Path, thumbnail: Path, fallback: datetime) -
 
         corrected = ImageOps.exif_transpose(image)
         width, height = corrected.size
+        image_hash = perceptual_hash(corrected)
         corrected.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
         if corrected.mode not in {"RGB", "RGBA"}:
             corrected = corrected.convert("RGB")
@@ -116,6 +132,7 @@ def extract_and_thumbnail(original: Path, thumbnail: Path, fallback: datetime) -
         return {
             "width": width,
             "height": height,
+            "perceptual_hash": image_hash,
             "taken_at": _taken_at(exif, fallback),
             "latitude": _decimal(gps.get("GPSLatitude"), gps.get("GPSLatitudeRef")),
             "longitude": _decimal(gps.get("GPSLongitude"), gps.get("GPSLongitudeRef")),
@@ -256,6 +273,12 @@ async def process_asset(asset_id: uuid.UUID) -> None:
                 except Exception:
                     asset.intelligence_status = "failed"
                     await session.commit()
+                try:
+                    group_asset_task.delay(str(asset.id))
+                except Exception:
+                    # Grouping is a private convenience index. It must never
+                    # make an otherwise healthy upload fail.
+                    pass
                 if settings.auto_protect_uploads:
                     try:
                         protect_asset_task.delay(str(asset.id))
@@ -319,6 +342,25 @@ async def index_asset(asset_id: uuid.UUID) -> None:
 @celery_app.task(name="index_asset", autoretry_for=(Exception,), retry_backoff=True, max_retries=2)
 def index_asset_task(asset_id: str) -> None:
     asyncio.run(index_asset(uuid.UUID(asset_id)))
+
+
+async def build_media_groups(asset_id: uuid.UUID) -> None:
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            asset = await session.get(Asset, asset_id)
+            if asset is None:
+                return
+            await group_asset(session, asset)
+            await session.commit()
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="group_media", autoretry_for=(Exception,), retry_backoff=True, max_retries=2)
+def group_asset_task(asset_id: str) -> None:
+    asyncio.run(build_media_groups(uuid.UUID(asset_id)))
 
 
 MEDIA_EXTENSIONS = {
@@ -435,6 +477,24 @@ async def protect_asset(asset_id: uuid.UUID) -> None:
                 return
             asset.protection_status = "protecting"
             await session.commit()
+            # Phase 2 selects the configured number of eligible drives and
+            # verifies every copy before exposing the asset as protected.
+            try:
+                await ensure_asset_replicas(session, asset)
+                await session.commit()
+                return
+            except Exception:
+                await session.rollback()
+                asset = await session.get(Asset, asset_id)
+                if asset is not None:
+                    asset.protection_status = "failed"
+                    await session.commit()
+                raise
+
+            # Kept below temporarily for compatibility with a worker process
+            # that imports old task code during a rolling deployment. The new
+            # policy-driven branch above always returns before this legacy
+            # single-drive implementation can run.
             source = (
                 validated_external_path(asset.original_path)
                 if asset.storage_source == "external"
@@ -538,115 +598,495 @@ def protect_asset_task(asset_id: str) -> None:
     asyncio.run(protect_asset(uuid.UUID(asset_id)))
 
 
-async def restore_asset(asset_id: uuid.UUID) -> None:
+class InvalidReplicaError(ValueError):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True)
+class ReplicaCandidate:
+    id: uuid.UUID
+    path: Path
+
+
+@dataclass(frozen=True)
+class ReplicaFailure:
+    id: uuid.UUID
+    reason: str
+
+
+class NoUsableReplicaError(RuntimeError):
+    def __init__(self, failures: list[ReplicaFailure]):
+        super().__init__("No checksum-valid protection copy is available")
+        self.failures = failures
+
+
+def _copy_verified_replica(
+    source: Path,
+    destination: Path,
+    expected_checksum: str,
+    timestamp: float | None,
+) -> None:
+    """Atomically publish one checksum-valid replica as the managed original."""
+    if not source.is_file():
+        raise InvalidReplicaError("missing")
+    try:
+        if sha256_file(source) != expected_checksum:
+            raise InvalidReplicaError("checksum_mismatch")
+    except FileNotFoundError as exc:
+        raise InvalidReplicaError("missing") from exc
+    except OSError as exc:
+        raise InvalidReplicaError("unreadable") from exc
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.restore")
+    try:
+        try:
+            with source.open("rb") as input_file, temporary.open("xb") as output_file:
+                shutil.copyfileobj(input_file, output_file, length=4 * 1024 * 1024)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+        except FileNotFoundError as exc:
+            raise InvalidReplicaError("disappeared") from exc
+        if sha256_file(temporary) != expected_checksum:
+            raise InvalidReplicaError("copy_checksum_mismatch")
+        os.replace(temporary, destination)
+        if timestamp is not None:
+            os.utime(destination, (timestamp, timestamp))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def restore_from_candidates(
+    candidates: list[ReplicaCandidate],
+    destination: Path,
+    expected_checksum: str,
+    timestamp: float | None = None,
+) -> tuple[uuid.UUID, list[ReplicaFailure]]:
+    """Try candidates in caller-defined order and stop at the first valid copy."""
+    failures: list[ReplicaFailure] = []
+    for candidate in candidates:
+        try:
+            _copy_verified_replica(candidate.path, destination, expected_checksum, timestamp)
+            return candidate.id, failures
+        except InvalidReplicaError as exc:
+            failures.append(ReplicaFailure(candidate.id, exc.code))
+    raise NoUsableReplicaError(failures)
+
+
+def _filesystem_timestamp(value: datetime | None) -> float | None:
+    if value is None:
+        return None
+    normalized = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return normalized.timestamp()
+
+
+async def _open_recovery_event(
+    session: AsyncSession,
+    asset: Asset,
+    *,
+    kind: str,
+    severity: str,
+    message: str,
+    detail: dict[str, object] | None = None,
+) -> MonitoringEvent:
+    existing = await session.scalar(select(MonitoringEvent).where(
+        MonitoringEvent.asset_id == asset.id,
+        MonitoringEvent.kind == kind,
+        MonitoringEvent.status == "open",
+    ))
+    if existing is not None:
+        existing.detail = detail
+        return existing
+    event = MonitoringEvent(
+        user_id=asset.user_id,
+        asset_id=asset.id,
+        kind=kind,
+        severity=severity,
+        message=message,
+        detail=detail,
+    )
+    session.add(event)
+    return event
+
+
+async def restore_asset(asset_id: uuid.UUID) -> bool:
     engine = create_async_engine(settings.database_url, poolclass=NullPool)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    metric_recorded = False
     try:
         async with session_factory() as session:
             asset = await session.get(Asset, asset_id)
-            if asset is None:
-                return
-            replica = await session.scalar(
-                select(AssetReplica).where(AssetReplica.asset_id == asset.id, AssetReplica.status == "verified")
-            )
-            if replica is None:
-                asset.restore_status = "failed"
-                await session.commit()
-                return
+            if asset is None or asset.lifecycle_state != "active":
+                metrics.operations.observe_recovery("asset_restore", "skipped")
+                metric_recorded = True
+                return False
+            replicas = list((await session.scalars(
+                select(AssetReplica)
+                .outerjoin(StorageDrive, StorageDrive.id == AssetReplica.drive_id)
+                .where(
+                    AssetReplica.asset_id == asset.id,
+                    AssetReplica.status == "verified",
+                    AssetReplica.verification_status == "verified",
+                )
+                .order_by(
+                    func.coalesce(StorageDrive.priority, 100).desc(),
+                    AssetReplica.verified_at.desc(),
+                    AssetReplica.id.asc(),
+                )
+            )).all())
             asset.restore_status = "restoring"
             await session.commit()
+
+            candidates: list[ReplicaCandidate] = []
+            failures: list[ReplicaFailure] = []
+            by_id = {replica.id: replica for replica in replicas}
+            for replica in replicas:
+                try:
+                    candidates.append(ReplicaCandidate(replica.id, validated_replica_drive_path(replica.path)))
+                except Exception:
+                    failures.append(ReplicaFailure(replica.id, "invalid_path"))
+
+            destination = original_path_for(
+                asset.checksum,
+                asset.original_filename,
+                asset.user_id if asset.encryption_version else None,
+            )
+            timestamp_value = asset.file_modified_at or asset.file_created_at or asset.taken_at
             try:
-                source = validated_storage_path(replica.path, settings.replica_path)
-                if await asyncio.to_thread(sha256_file, source) != asset.storage_checksum:
-                    raise ValueError("Protection copy failed checksum verification")
-                destination = original_path_for(
-                    asset.checksum,
-                    asset.original_filename,
-                    asset.user_id if asset.encryption_version else None,
+                selected_id, attempted_failures = await asyncio.to_thread(
+                    restore_from_candidates,
+                    candidates,
+                    destination,
+                    asset.storage_checksum,
+                    _filesystem_timestamp(timestamp_value),
                 )
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.restore")
-                with source.open("rb") as input_file, temporary.open("xb") as output_file:
-                    shutil.copyfileobj(input_file, output_file, length=4 * 1024 * 1024)
-                    output_file.flush()
-                    os.fsync(output_file.fileno())
-                if await asyncio.to_thread(sha256_file, temporary) != asset.storage_checksum:
-                    raise ValueError("Restored original failed checksum verification")
-                os.replace(temporary, destination)
-                timestamp = asset.file_modified_at or asset.taken_at
-                if timestamp:
-                    os.utime(destination, (timestamp.timestamp(), timestamp.timestamp()))
+                failures.extend(attempted_failures)
+                for failure in failures:
+                    replica = by_id[failure.id]
+                    replica.status = "failed"
+                    replica.verification_status = "failed"
+                    replica.failure_count += 1
+                    replica.last_error = f"Restore candidate failed: {failure.reason}"
+                selected = by_id[selected_id]
+                selected.status = "verified"
+                selected.verification_status = "verified"
+                selected.failure_count = 0
+                selected.last_error = None
+                selected.verified_at = datetime.now(timezone.utc)
                 asset.original_path = str(destination)
                 asset.storage_source = "managed"
                 asset.external_library_id = None
                 asset.restore_status = "restored"
                 asset.restored_at = datetime.now(timezone.utc)
+                if failures:
+                    asset.protection_status = "degraded"
+                open_events = list((await session.scalars(select(MonitoringEvent).where(
+                    MonitoringEvent.asset_id == asset.id,
+                    MonitoringEvent.status == "open",
+                    MonitoringEvent.kind.in_([
+                        "automatic_restore",
+                        "original_missing_recovery_available",
+                        "original_unrecoverable",
+                        "restore_write_failed",
+                    ]),
+                ))).all())
+                for event in open_events:
+                    event.status = "resolved"
+                    event.resolved_at = datetime.now(timezone.utc)
                 await session.commit()
-            except Exception:
-                await session.rollback()
-                asset = await session.get(Asset, asset_id)
-                if asset is not None:
-                    asset.restore_status = "failed"
-                    await session.commit()
+                await notify_user_devices(
+                    session,
+                    asset.user_id,
+                    title="Storage recovery completed",
+                    body="Drivebound restored the original from a verified protection copy.",
+                    data={"kind": "storage_recovered", "asset_id": str(asset.id)},
+                )
+                metrics.operations.observe_recovery("asset_restore", "success")
+                metric_recorded = True
+                return True
+            except NoUsableReplicaError as exc:
+                failures.extend(exc.failures)
+                for failure in failures:
+                    replica = by_id.get(failure.id)
+                    if replica is not None:
+                        replica.status = "failed"
+                        replica.verification_status = "failed"
+                        replica.failure_count += 1
+                        replica.last_error = f"Restore candidate failed: {failure.reason}"
+                asset.restore_status = "failed"
+                asset.protection_status = "failed"
+                await _open_recovery_event(
+                    session,
+                    asset,
+                    kind="original_unrecoverable",
+                    severity="critical",
+                    message="The original is unavailable and every verified protection copy failed validation.",
+                    detail={
+                        "attempted_replicas": len(replicas),
+                        "failed_replica_ids": [str(failure.id) for failure in failures],
+                    },
+                )
+                await notify_user_devices(
+                    session,
+                    asset.user_id,
+                    title="Storage recovery needs attention",
+                    body="Drivebound could not find a valid protection copy for one original.",
+                    data={"kind": "storage_unrecoverable", "asset_id": str(asset.id)},
+                )
+                await session.commit()
+                metrics.operations.observe_recovery("asset_restore", "unrecoverable")
+                metric_recorded = True
+                return False
+            except Exception as exc:
+                asset.restore_status = "failed"
+                await _open_recovery_event(
+                    session,
+                    asset,
+                    kind="restore_write_failed",
+                    severity="warning",
+                    message="A verified copy was found, but the managed original could not be written.",
+                    detail={"reason": type(exc).__name__},
+                )
+                await session.commit()
                 raise
+    except Exception:
+        if not metric_recorded:
+            metrics.operations.observe_recovery("asset_restore", "failed")
+        raise
     finally:
         await engine.dispose()
 
 
 @celery_app.task(name="restore_asset", autoretry_for=(Exception,), retry_backoff=True, max_retries=2)
-def restore_asset_task(asset_id: str) -> None:
-    asyncio.run(restore_asset(uuid.UUID(asset_id)))
+def restore_asset_task(asset_id: str) -> bool:
+    return asyncio.run(restore_asset(uuid.UUID(asset_id)))
 
 
-async def monitor_storage() -> None:
+async def monitor_storage(user_id: uuid.UUID | None = None, *, repair: bool = True) -> None:
     """Verify originals and protection copies and queue safe, automatic recovery."""
     engine = create_async_engine(settings.database_url, poolclass=NullPool)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    mode = "scheduled_repair" if user_id is None else ("verify_and_repair" if repair else "verify_only")
+    results: Counter[str] = Counter()
     try:
         async with session_factory() as session:
-            assets = (await session.scalars(select(Asset))).all()
+            asset_statement = select(Asset).where(Asset.lifecycle_state == "active")
+            if user_id is not None:
+                asset_statement = asset_statement.where(Asset.user_id == user_id)
+            assets = (await session.scalars(asset_statement)).all()
             for asset in assets:
                 original = Path(asset.original_path)
-                replica = await session.scalar(select(AssetReplica).where(AssetReplica.asset_id == asset.id))
+                replicas = list((await session.scalars(
+                    select(AssetReplica).where(AssetReplica.asset_id == asset.id)
+                )).all())
                 original_ok = original.is_file() and await asyncio.to_thread(sha256_file, original) == asset.storage_checksum
-                replica_ok = bool(replica and Path(replica.path).is_file() and await asyncio.to_thread(sha256_file, Path(replica.path)) == asset.storage_checksum)
-                if not original_ok and replica_ok and asset.storage_source == "managed":
-                    already_open = await session.scalar(select(MonitoringEvent).where(
-                        MonitoringEvent.asset_id == asset.id,
-                        MonitoringEvent.kind == "automatic_restore",
-                        MonitoringEvent.status == "open",
-                    ))
-                    if already_open is None:
-                        session.add(MonitoringEvent(
-                            user_id=asset.user_id, asset_id=asset.id, kind="automatic_restore",
-                            severity="warning", message="Original was missing; restore queued from verified protection copy.",
+                healthy_replicas = []
+                for replica in replicas:
+                    try:
+                        replica_path = validated_replica_drive_path(replica.path)
+                        healthy = replica_path.is_file() and await asyncio.to_thread(sha256_file, replica_path) == asset.storage_checksum
+                        if healthy:
+                            healthy_replicas.append(replica)
+                            replica.status = "verified"
+                            replica.verification_status = "verified"
+                            replica.failure_count = 0
+                            replica.last_error = None
+                            replica.verified_at = datetime.now(timezone.utc)
+                        else:
+                            replica.status = "failed"
+                            replica.verification_status = "failed"
+                            replica.failure_count += 1
+                            replica.last_error = "Replica is missing or checksum verification failed"
+                    except Exception as exc:
+                        replica.status = "failed"
+                        replica.verification_status = "failed"
+                        replica.failure_count += 1
+                        replica.last_error = str(exc)[:1000]
+                if original_ok:
+                    results["healthy" if healthy_replicas else "replica_degraded"] += 1
+                elif healthy_replicas:
+                    results["recoverable"] += 1
+                else:
+                    results["unrecoverable"] += 1
+                if not original_ok and healthy_replicas and asset.storage_source == "managed":
+                    if repair:
+                        already_open = await session.scalar(select(MonitoringEvent).where(
+                            MonitoringEvent.asset_id == asset.id,
+                            MonitoringEvent.kind == "automatic_restore",
+                            MonitoringEvent.status == "open",
                         ))
-                        await notify_user_devices(
+                        if already_open is None:
+                            session.add(MonitoringEvent(
+                                user_id=asset.user_id, asset_id=asset.id, kind="automatic_restore",
+                                severity="warning", message="Original was missing; restore queued from verified protection copies.",
+                            ))
+                            await notify_user_devices(
+                                session,
+                                asset.user_id,
+                                title="Storage recovery started",
+                                body="Drivebound is restoring a missing original from a verified protection copy.",
+                                data={"kind": "storage_warning", "asset_id": str(asset.id)},
+                            )
+                            asset.restore_status = "queued"
+                            restore_asset_task.delay(str(asset.id))
+                            metrics.operations.observe_recovery("asset_restore", "queued")
+                    else:
+                        await _open_recovery_event(
                             session,
-                            asset.user_id,
-                            title="Storage recovery started",
-                            body="Drivebound is restoring a missing original from its verified protection copy.",
-                            data={"kind": "storage_warning", "asset_id": str(asset.id)},
+                            asset,
+                            kind="original_missing_recovery_available",
+                            severity="warning",
+                            message="The managed original is missing, but a checksum-valid protection copy is available.",
+                            detail={"healthy_replicas": len(healthy_replicas)},
                         )
-                        restore_asset_task.delay(str(asset.id))
-                elif original_ok and not replica_ok and settings.auto_protect_uploads:
+                elif not original_ok and not healthy_replicas:
+                    asset.restore_status = "failed"
+                    asset.protection_status = "failed"
+                    await _open_recovery_event(
+                        session,
+                        asset,
+                        kind="original_unrecoverable",
+                        severity="critical",
+                        message="The original is unavailable and no checksum-valid protection copy is available.",
+                        detail={"attempted_replicas": len(replicas)},
+                    )
+                elif repair and original_ok and settings.auto_protect_uploads and (len(healthy_replicas) < 1 or asset.protection_status != "protected"):
                     asset.protection_status = "pending"
                     protect_asset_task.delay(str(asset.id))
-                elif original_ok and replica_ok:
+                elif original_ok and healthy_replicas:
                     events = (await session.scalars(select(MonitoringEvent).where(
-                        MonitoringEvent.asset_id == asset.id, MonitoringEvent.status == "open"
+                        MonitoringEvent.asset_id == asset.id,
+                        MonitoringEvent.status == "open",
+                        MonitoringEvent.kind.in_([
+                            "automatic_restore",
+                            "original_missing_recovery_available",
+                            "original_unrecoverable",
+                            "restore_write_failed",
+                            "replica_verification_failed",
+                        ]),
                     ))).all()
                     for event in events:
                         event.status = "resolved"
                         event.resolved_at = datetime.now(timezone.utc)
+            await session.commit()
+        metrics.operations.observe_storage_run(mode, "success", results)
+    except Exception:
+        metrics.operations.observe_storage_run(mode, "failure")
+        raise
+    finally:
+        await engine.dispose()
+
+
+async def finish_account_verification(
+    user_id: uuid.UUID,
+    verification_id: uuid.UUID,
+    outcome: str,
+) -> None:
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            verification = await session.scalar(
+                select(MonitoringEvent)
+                .where(
+                    MonitoringEvent.id == verification_id,
+                    MonitoringEvent.user_id == user_id,
+                    MonitoringEvent.kind == "account_storage_verification",
+                    MonitoringEvent.status == "open",
+                )
+                .order_by(MonitoringEvent.created_at.desc())
+                .limit(1)
+                .with_for_update()
+            )
+            if verification is None:
+                return
+            verification.status = "resolved" if outcome == "completed" else "failed"
+            verification.resolved_at = datetime.now(timezone.utc)
+            verification.message = (
+                "Account storage verification completed."
+                if outcome == "completed"
+                else "Account storage verification failed before completion."
+            )
+            verification.detail = {**(verification.detail or {}), "outcome": outcome}
             await session.commit()
     finally:
         await engine.dispose()
 
 
 @celery_app.task(name="monitor_storage")
-def monitor_storage_task() -> None:
-    asyncio.run(monitor_storage())
+def monitor_storage_task(
+    user_id: str | None = None,
+    repair: bool = True,
+    verification_id: str | None = None,
+) -> None:
+    parsed_user_id = uuid.UUID(user_id) if user_id else None
+    parsed_verification_id = uuid.UUID(verification_id) if verification_id else None
+    try:
+        asyncio.run(monitor_storage(parsed_user_id, repair=repair))
+    except Exception:
+        metrics.operations.observe_recovery("storage_verification", "failed")
+        if parsed_user_id is not None and parsed_verification_id is not None:
+            try:
+                asyncio.run(finish_account_verification(parsed_user_id, parsed_verification_id, "failed"))
+            except Exception:
+                pass
+        raise
+    metrics.operations.observe_recovery("storage_verification", "success")
+    if parsed_user_id is not None and parsed_verification_id is not None:
+        asyncio.run(finish_account_verification(parsed_user_id, parsed_verification_id, "completed"))
+
+
+async def rebalance_user_storage(user_id: uuid.UUID) -> int:
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            moved = await rebalance_replicas(session, user_id)
+            await session.commit()
+            return moved
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="rebalance_user_storage", autoretry_for=(Exception,), retry_backoff=True, max_retries=2)
+def rebalance_user_storage_task(user_id: str) -> int:
+    return asyncio.run(rebalance_user_storage(uuid.UUID(user_id)))
+
+
+async def purge_expired_assets(asset_id: uuid.UUID | None = None) -> int:
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            return await purge_due_assets(session, asset_id=asset_id)
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="purge_expired_assets")
+def purge_expired_assets_task(asset_id: str | None = None) -> int:
+    return asyncio.run(purge_expired_assets(uuid.UUID(asset_id) if asset_id else None))
+
+
+async def backup_operational_state() -> None:
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            await create_configuration_backup(session)
+            await create_database_backup(session)
+            await verify_operational_backups(session)
+            await prune_operational_backups(session)
+            await session.commit()
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="backup_operational_state")
+def backup_operational_state_task() -> None:
+    asyncio.run(backup_operational_state())
 
 
 async def migrate_legacy_media(limit: int = 10) -> int:

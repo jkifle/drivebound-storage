@@ -1,0 +1,37 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      backend-runtime:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      frontend-runtime:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /mobile
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      mobile-runtime:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]

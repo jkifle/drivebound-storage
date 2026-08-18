@@ -1,7 +1,9 @@
 import uuid
+import json
 from datetime import datetime
+from typing import Any, Literal
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 class RegisterRequest(BaseModel):
@@ -23,6 +25,8 @@ class UserResponse(BaseModel):
     onboarding_completed_at: datetime | None = None
     email_verified_at: datetime | None = None
     two_factor_enabled: bool = False
+    has_password: bool = True
+    reauth_methods: list[Literal["password", "google", "passkey"]] = Field(default_factory=list)
 
 
 class TokenResponse(BaseModel):
@@ -59,8 +63,9 @@ class ResetPasswordRequest(TokenRequest):
 
 
 class ChangePasswordRequest(BaseModel):
-    current_password: str = Field(min_length=1, max_length=1024)
+    current_password: str | None = Field(default=None, min_length=1, max_length=1024)
     new_password: str = Field(min_length=12, max_length=1024)
+    otp: str | None = Field(default=None, min_length=6, max_length=32)
 
 
 class OnboardingUpdate(BaseModel):
@@ -90,17 +95,21 @@ class TotpConfirmRequest(BaseModel):
     code: str = Field(min_length=6, max_length=8)
 
 
+class FactorProofRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=32)
+
+
 class RecoveryCodesResponse(BaseModel):
     recovery_codes: list[str]
 
 
 class DisableMfaRequest(BaseModel):
-    password: str = Field(min_length=1, max_length=1024)
-    code: str = Field(min_length=6, max_length=32)
+    password: str | None = Field(default=None, min_length=1, max_length=1024)
+    code: str | None = Field(default=None, min_length=6, max_length=32)
 
 
 class DeleteAccountRequest(BaseModel):
-    password: str = Field(min_length=1, max_length=1024)
+    password: str | None = Field(default=None, min_length=1, max_length=1024)
     code: str | None = Field(default=None, min_length=6, max_length=32)
     confirmation: str
 
@@ -112,3 +121,67 @@ class AuditEventResponse(BaseModel):
     user_agent: str | None
     detail: dict | None
     created_at: datetime
+
+
+class ReauthenticateRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=1024)
+    otp: str | None = Field(default=None, min_length=6, max_length=32)
+
+
+class PasskeyLoginOptionsRequest(BaseModel):
+    email: EmailStr | None = None
+
+
+class PasskeyOptionsResponse(BaseModel):
+    challenge_id: uuid.UUID
+    public_key: dict[str, Any]
+
+
+class PasskeyCredentialRequest(BaseModel):
+    challenge_id: uuid.UUID
+    credential: dict[str, Any]
+
+    @field_validator("credential")
+    @classmethod
+    def bounded_credential(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            encoded = json.dumps(value, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("credential must be finite JSON") from exc
+        if len(encoded) > 1024 * 1024:
+            raise ValueError("credential may be at most 1 MiB")
+        return value
+
+
+class PasskeyRegistrationRequest(PasskeyCredentialRequest):
+    name: str = Field(min_length=1, max_length=120)
+
+    @field_validator("name")
+    @classmethod
+    def nonempty_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("name must not be blank")
+        return normalized
+
+
+class PasskeyRenameRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+    @field_validator("name")
+    @classmethod
+    def nonempty_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("name must not be blank")
+        return normalized
+
+
+class PasskeyResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    transports: list[str]
+    device_type: str
+    backed_up: bool
+    created_at: datetime
+    last_used_at: datetime | None

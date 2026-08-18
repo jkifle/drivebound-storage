@@ -10,7 +10,7 @@ Drivebound is an expandable personal cloud backed by drives you own. It provides
 4. Run `docker compose up --build -d`.
 5. Open <http://localhost:3000>, create an account, and complete setup.
 
-The backend applies Alembic migrations through `0013` before starting. Confirm the current migration with:
+The backend applies Alembic migrations through `0015` before starting. Confirm the current migration with:
 
 ```text
 docker compose exec backend alembic current
@@ -56,6 +56,7 @@ The host directories are:
 - `data/derivatives` for generated thumbnails and previews
 - `data/staging` for incomplete resumable transfers
 - `data/replicas` for verified protection copies
+- `data/backups` for incremental configuration and logical database archives
 
 Originals are checksum-addressed and created without overwriting an existing path. The worker can write only to the managed originals and replica mounts so it can complete verified restores. Staged files are removed after ingestion succeeds or fails.
 
@@ -63,7 +64,15 @@ New uploads and imported media are automatically copied to the protection drive.
 
 Managed uploads and generated thumbnails are encrypted at rest with an account-specific AES-256-GCM key. The deployment master key wraps each account key and must come from a file-backed secret in staging and production. This deliberately preserves local preview, OCR, and future face processing; it is not a zero-knowledge mode. Set `MEDIA_ENCRYPTION_MIGRATE_LEGACY=true` only after taking a verified backup to migrate pre-encryption managed media in bounded background batches.
 
-For real drive-failure protection, mount `/data/replicas` from a second physical drive. Keeping originals and replicas on the same disk verifies the workflow but does not protect against physical disk failure.
+For real drive-failure protection, mount `/data/replicas` from a second physical drive. Keeping originals and replicas on the same disk verifies the workflow but does not protect against physical disk failure. To add further drives, mount each at a path in `REPLICA_ROOTS`, then add the approved container path in **Storage**. A policy selects the desired verified-copy count, drive priority, eligibility, balancing threshold, and retention period. A move is never destructive: the destination copy must checksum-verify before the source copy is released.
+
+## Lifecycle, recovery, and backups
+
+Files use immutable revisions. Moving an item to **Trash** records an audit event and a `purge_after` date; restore is available throughout the configured retention period. Rollback makes a previous revision active without overwriting it. The scheduled purge removes Drivebound-managed originals, derivatives, and replicas only after retention has expired and no other revision references those bytes. External libraries remain read-only and are never deleted by Drivebound.
+
+The scheduler writes deduplicated configuration snapshots and periodic logical PostgreSQL archives under `BACKUPS_PATH`. Each database archive is checked with `pg_restore --list` before it counts as verified. Archives older than `DATABASE_BACKUP_RETENTION_DAYS` are pruned. Review their verification state in **Storage**.
+
+`GET /api/v1/storage/recovery` provides an authenticated readiness summary without exposing host paths, checksums, or secrets. Account-scoped `POST /api/v1/monitoring/verify` performs a non-destructive checksum scan; `POST /api/v1/monitoring/run` also permits safe repair from verified copies. Follow the [recovery drill runbook](docs/operations/recovery-drill.md) for isolated PostgreSQL and media restore testing.
 
 ## Browser upload
 
@@ -93,7 +102,7 @@ Items are ordered by `taken_at DESC`, falling back to `created_at`. Equal timest
 
 ## Desktop folder sync
 
-The dependency-free desktop client reads source files without modifying them and keeps a small local resume journal:
+The dependency-free desktop client synchronizes one explicitly selected folder at a time. It keeps `.drivebound-sync.json` with logical IDs, revisions, resumable upload state, and a server cursor. Renames are journaled as moves; deletion is an explicit tombstone operation; a simultaneous edit or delete/change is recorded as a conflict and neither local version is silently overwritten:
 
 ```powershell
 python tools\drivebound_sync.py "D:\Pictures" `
@@ -101,13 +110,15 @@ python tools\drivebound_sync.py "D:\Pictures" `
   --token YOUR_ACCESS_TOKEN
 ```
 
+Run the same command with `--root-id ROOT_ID` on a second computer to join an existing selected-folder root. The client first pulls acknowledged remote operations, then publishes local changes. It exits with status `2` when a conflict needs a choice in Drivebound, leaving both local data and the server revision intact.
+
 Obtain a token from `POST /api/v1/auth/token`, using the account email as the OAuth `username`. Treat the token like a password until it expires.
 
 ## Mobile backup
 
 The native Expo client lives in `mobile`. Install its packages with `npm install`, then use `npx expo run:android` or `npx expo run:ios`. Connect with the same Drivebound account used on the web. On a physical phone, enter the computer's LAN or HTTPS API address rather than `localhost`.
 
-Each installation receives a separate revocable device credential. Camera-roll uploads resume in a durable SQLite transfer queue and preserve the untouched bytes, filename, filesystem dates, capture time, EXIF, GPS, and video-container metadata. The app includes library browsing, search, albums, memories, location discovery, sharing, video playback, original restore-to-phone, Wi-Fi/charging/bandwidth/schedule controls, and notification registration. The operating system schedules automatic backups; a native development/release build is required because background tasks do not run in Expo Go.
+Each installation receives a separate revocable device credential. Camera-roll uploads resume in a device-scoped durable SQLite transfer queue with expired-lease recovery, bounded retry, and user-visible pause, cancel, and retry controls. The untouched bytes, filename, filesystem dates, capture time, EXIF, GPS, and video-container metadata are preserved. The app includes paginated library browsing, search, albums, memories, location discovery, authenticated sharing/downloads, video playback, original restore-to-phone, Wi-Fi/charging/bandwidth/schedule controls, and notification registration. The operating system schedules automatic backups; a native development/release build is required because background tasks do not run in Expo Go.
 
 ## Search intelligence and recovery
 
@@ -125,21 +136,50 @@ Storage nodes pair through a single-use 10-minute code. On the node host run:
 python tools\drivebound_node.py http://localhost:8000 --pair-code ABCD1234 --name "Basement drive"
 ```
 
-The returned secret is stored only on that node and can be revoked from the web Storage panel.
+The node generates a local Ed25519 identity, proves possession when claiming the
+code, and signs every heartbeat. Its private key and returned node secret are
+written atomically with restricted permissions under `%LOCALAPPDATA%\Drivebound`
+on Windows or `$XDG_CONFIG_HOME/Drivebound` on Unix. Repository-local override
+names are ignored by Git, but the default keeps credentials outside the project.
+For a remote server, use HTTPS. Rotate the opaque node secret
+without replacing its signing identity with:
+
+```powershell
+python tools\drivebound_node.py https://drivebound.example --rotate-secret --once
+```
+
+Nodes paired before attestation support was added are deliberately blocked. Give
+the node a new pairing code and pair it again; the old record can then be revoked
+from the Storage panel. See the [node attestation contract](docs/security/node-attestation.md)
+for interoperability and recovery details.
 
 ## Secure remote access
 
 The Docker ports bind to loopback by default. Put Drivebound behind a trusted HTTPS reverse proxy, VPN, or authenticated tunnel rather than forwarding ports 3000 or 8000 directly from a router. For internet access, set HTTPS `APP_URL`, `API_URL`, and `GOOGLE_REDIRECT_URI`, then set `REMOTE_ACCESS_ENABLED=true`, `AUTH_COOKIE_SECURE=true`, and list the public hostnames in `TRUSTED_HOSTS`. Startup is rejected when remote mode uses HTTP, wildcard CORS, or default/short secrets.
 
+Remote deployments must also configure `METRICS_AUTH_TOKEN`; staging and production load it from `METRICS_AUTH_TOKEN_FILE`. Prometheus scrapers send it as a bearer token to `/metrics`. Keep the endpoint network-private even when token protection is enabled.
+
+## Validation
+
+Run the complete local release gate from PowerShell:
+
+```powershell
+.\tools\validate.ps1
+```
+
+Add `-Docker` to validate both Compose configurations and `-Android` to build the Android debug application with Android Studio's bundled JDK. CI runs backend tests, frontend lint/build, mobile type checking, Compose migrations, and guaranteed volume cleanup independently.
+
 ## Current product status
 
 - **Account access:** registration, login, HTTP-only sessions, logout, onboarding, and mandatory owner filtering are implemented.
 - **Mobile experience:** a native Expo library, discovery, sharing, restore, SQLite-backed resumable transfer queue, policy controls, local/Expo push notifications, and OS-scheduled background backup are implemented.
-- **Protection:** automatic verified copies, metadata sidecars, bulk protection status, and checksum-verified restore are implemented under `/data/replicas`.
+- **Storage lifecycle:** multi-drive verified replica policies, safe balancing, immutable revisions, rollback, Trash retention, audited purge, and operational backup verification are implemented.
+- **Desktop sync:** selective folder roots use durable local/server journals, explicit delete tombstones, resumable transfers, reconnect cursors, and visible conflict records.
+- **Media grouping:** account-private perceptual near-duplicate candidates, RAW/JPEG, Live Photo/motion-photo, and burst groups are derived locally from metadata and image content.
 - **Private sharing:** opaque, hashed, expiring links and optional Argon2 password protection are implemented.
 - **Organization:** Files, collaborative Albums, OCR/semantic Search, Memories, and GPS Map screens are connected to permission-scoped APIs.
-- **Operations:** scheduled integrity monitoring, automatic original/replica repair, health events, and hosted node pairing are implemented.
-- **Production foundation:** hybrid deployment configuration, file-backed production secrets, account-scoped media encryption, structured request logging, Prometheus metrics, and CI/release-candidate workflows are implemented.
+- **Operations:** scheduled integrity monitoring, account-scoped verification, multi-replica automatic repair, health events, and Ed25519-attested storage-node pairing/credential rotation are implemented.
+- **Production foundation:** hybrid deployment configuration, file-backed production secrets, account-scoped media encryption, structured route-safe request logging, bearer-protected Prometheus metrics, dependency update automation, and CI/release-candidate workflows are implemented.
 - **Interface:** registration, onboarding, library, storage, uploads, viewer, and public sharing use the centralized neumorphic design system.
 
 ## Storage health scope

@@ -7,7 +7,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.security import current_user_or_device, hash_password, opaque_token, token_digest, verify_password
+from app.core.security import (
+    current_user_or_device,
+    hash_password_async,
+    opaque_token,
+    token_digest,
+    verify_password_async,
+)
 from app.db.session import get_db
 from app.models.asset import Asset
 from app.models.share import ShareLink
@@ -27,10 +33,10 @@ async def resolve_share(session: AsyncSession, token: str, password: str | None)
     expires_at = share.expires_at
     if expires_at and (expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)) <= now:
         raise HTTPException(status_code=410, detail="Share has expired")
-    if share.password_hash and (not password or not verify_password(password, share.password_hash)):
+    if share.password_hash and (not password or not await verify_password_async(password, share.password_hash)):
         raise HTTPException(status_code=401, detail="Share password is required or incorrect")
     asset = await session.get(Asset, share.asset_id)
-    if asset is None:
+    if asset is None or asset.lifecycle_state != "active":
         raise HTTPException(status_code=404, detail="Shared asset not found")
     return share, asset
 
@@ -41,7 +47,7 @@ async def create_share(
     session: AsyncSession = Depends(get_db),
     user: User = Depends(current_user_or_device),
 ) -> ShareResponse:
-    asset = await session.scalar(select(Asset).where(Asset.id == payload.asset_id, Asset.user_id == user.id))
+    asset = await session.scalar(select(Asset).where(Asset.id == payload.asset_id, Asset.user_id == user.id, Asset.lifecycle_state == "active"))
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     token = opaque_token()
@@ -49,7 +55,7 @@ async def create_share(
         user_id=user.id,
         asset_id=payload.asset_id,
         token_hash=token_digest(token),
-        password_hash=hash_password(payload.password) if payload.password else None,
+        password_hash=await hash_password_async(payload.password) if payload.password else None,
         allow_download=payload.allow_download,
         expires_at=(datetime.now(timezone.utc) + timedelta(hours=payload.expires_in_hours))
         if payload.expires_in_hours

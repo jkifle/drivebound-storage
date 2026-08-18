@@ -1,5 +1,11 @@
 .env
+.env.*
+!.env.example
 .secrets/
+.drivebound-node.json
+*.drivebound-node*.tmp
+.drivebound-sync.json
+*.drivebound-sync*.tmp
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -12,9 +18,12 @@ data/derivatives/*
 data/staging/*
 data/replicas/*
 data/imports/*
+data/backups/*
 !data/originals/.gitkeep
 !data/derivatives/.gitkeep
 !data/staging/.gitkeep
 !data/replicas/.gitkeep
 !data/imports/.gitkeep
+!data/backups/.gitkeep
 mobile/node_modules
+mobile/.expo/

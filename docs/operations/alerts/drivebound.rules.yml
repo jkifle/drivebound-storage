@@ -1,0 +1,130 @@
+groups:
+  - name: drivebound-api
+    rules:
+      - alert: DriveboundApiTargetDown
+        expr: up{job="drivebound-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Drivebound API metrics target is unavailable
+          runbook: docs/operations/observability.md#api-and-worker-availability
+
+      - alert: DriveboundHttpErrorRatioHigh
+        expr: >-
+          sum(rate(drivebound_http_requests_total{status=~"5.."}[5m]))
+          / clamp_min(sum(rate(drivebound_http_requests_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than five percent of Drivebound API requests are failing
+          runbook: docs/operations/observability.md#api-and-worker-availability
+
+  - name: drivebound-worker
+    rules:
+      - alert: DriveboundWorkerHeartbeatStale
+        expr: time() - drivebound_worker_last_heartbeat_unixtime > 180
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: No Drivebound worker heartbeat has been observed for three minutes
+          runbook: docs/operations/observability.md#api-and-worker-availability
+
+      - alert: DriveboundWorkerTaskFailures
+        expr: sum(increase(drivebound_worker_tasks_total{outcome="failure"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: A Drivebound worker task failed
+          runbook: docs/operations/observability.md#queue-and-task-failures
+
+      - alert: DriveboundQueuePublishFailures
+        expr: sum(increase(drivebound_queue_publish_total{outcome="failed"}[10m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Drivebound could not publish work to its task broker
+          runbook: docs/operations/observability.md#queue-and-task-failures
+
+      - alert: DriveboundQueueWaitHigh
+        expr: >-
+          sum(rate(drivebound_queue_wait_duration_seconds_total[15m]))
+          / clamp_min(sum(rate(drivebound_queue_started_total[15m])), 0.001) > 120
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Drivebound tasks are waiting more than two minutes on average
+          runbook: docs/operations/observability.md#queue-and-task-failures
+
+  - name: drivebound-storage-recovery
+    rules:
+      - alert: DriveboundScheduledStorageVerificationStale
+        expr: >-
+          time() - drivebound_storage_verification_last_success_unixtime{mode="scheduled_repair"} > 2700
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Scheduled storage verification has not completed for 45 minutes
+          runbook: docs/operations/observability.md#storage-and-recovery
+
+      - alert: DriveboundUnrecoverableMediaDetected
+        expr: increase(drivebound_storage_assets_verified_total{result="unrecoverable"}[30m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: Storage verification found media without a checksum-valid copy
+          runbook: docs/operations/observability.md#storage-and-recovery
+
+      - alert: DriveboundRecoveryFailed
+        expr: sum(increase(drivebound_recovery_operations_total{outcome=~"failed|unrecoverable"}[15m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: A Drivebound recovery operation failed
+          runbook: docs/operations/observability.md#storage-and-recovery
+
+  - name: drivebound-backups-evidence
+    rules:
+      - alert: DriveboundDatabaseBackupStale
+        expr: time() - drivebound_backup_last_verified_unixtime{kind="database"} > 129600
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: No verified Drivebound database backup is newer than 36 hours
+          runbook: docs/operations/recovery-drill.md
+
+      - alert: DriveboundConfigurationBackupStale
+        expr: time() - drivebound_backup_last_verified_unixtime{kind="configuration"} > 129600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: No verified Drivebound configuration backup is newer than 36 hours
+          runbook: docs/operations/recovery-drill.md
+
+      - alert: DriveboundBackupFailure
+        expr: sum(increase(drivebound_backup_operations_total{outcome="failed"}[30m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: An operational backup failed creation or verification
+          runbook: docs/operations/recovery-drill.md
+
+      - alert: DriveboundRecoveryEvidenceOverdue
+        expr: time() - drivebound_recovery_evidence_last_success_unixtime > 3024000
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: No successful structural recovery-input evidence has been published for 35 days
+          runbook: docs/operations/recovery-drill.md
