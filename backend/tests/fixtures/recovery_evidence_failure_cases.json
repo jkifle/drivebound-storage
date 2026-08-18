@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "cases": [
+    {"name": "checksum_mismatch", "expected_code": "checksum_mismatch"},
+    {"name": "database_invalid_format", "expected_code": "invalid_format"},
+    {"name": "database_tool_unavailable", "expected_code": "verification_tool_unavailable"},
+    {"name": "input_changed_during_read", "expected_code": "changed_during_verification"},
+    {"name": "redacted_unexpected_failure", "expected_code": "verification_failed"}
+  ]
+}

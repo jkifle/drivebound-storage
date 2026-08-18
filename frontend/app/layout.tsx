@@ -6,6 +6,7 @@ export const metadata: Metadata = {
   metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"),
   title: "Drivebound — Your storage. Your cloud.",
   description: "Expandable private photo storage backed by drives you own.",
+  referrer: "no-referrer",
   icons: { icon: "/favicon.svg", shortcut: "/favicon.svg" },
   manifest: "/manifest.webmanifest",
   openGraph: {
@@ -19,5 +20,5 @@ export const metadata: Metadata = {
 export const viewport: Viewport = { themeColor: "#E0E5EC", colorScheme: "light" };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
-  return <html lang="en"><body><ScrollMotion />{children}</body></html>;
+  return <html lang="en"><body><a className="skip-link" href="#main-content">Skip to main content</a><ScrollMotion />{children}</body></html>;
 }

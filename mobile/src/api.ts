@@ -6,6 +6,13 @@ export const DEVICE_TOKEN = "drivebound.deviceToken";
 export const SERVER_URL = "drivebound.serverUrl";
 export const DEVICE_ID = "drivebound.deviceId";
 
+export class DriveboundApiError extends Error {
+  constructor(message: string, readonly status: number | null = null) {
+    super(message);
+    this.name = "DriveboundApiError";
+  }
+}
+
 export type TimelineAsset = {
   id: string; mime_type: string; width: number | null; height: number | null; duration_seconds: number | null;
   taken_at: string | null; timeline_at: string; day: string; processing_status: string;
@@ -13,14 +20,48 @@ export type TimelineAsset = {
   protection_status: string; restore_status: string;
 };
 export type TimelinePage = { items: TimelineAsset[]; next_cursor: string | null; has_more: boolean };
+export type AssetDetail = {
+  id: string;
+  file_size: number;
+  mime_type: string;
+  width: number | null;
+  height: number | null;
+  duration_seconds: number | null;
+  taken_at: string | null;
+  file_created_at: string | null;
+  file_modified_at: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  camera_make: string | null;
+  camera_model: string | null;
+  lens_model: string | null;
+  original_filename: string | null;
+  protection_status: string;
+  processing_status: string;
+};
 export type Album = { id: string; name: string; description: string | null; asset_count: number; cover_thumbnail_url: string | null; role: "owner" | "editor" | "viewer" };
 export type MapAsset = { id: string; latitude: number; longitude: number; taken_at: string | null; thumbnail_url: string | null; name: string };
 export type ShareResult = { url: string; expires_at: string | null };
 
 export function normalizeServerUrl(server: string): string {
   const value = server.trim().replace(/\/$/, "");
-  try { return new URL(value).toString().replace(/\/$/, ""); }
-  catch { throw new Error("Enter a complete server URL, such as https://drivebound.example.com"); }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("Enter a complete server URL, such as https://drivebound.example.com");
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new Error("Drivebound server addresses must use http or https");
+  }
+  if (!__DEV__ && parsed.protocol !== "https:") {
+    throw new Error("Production Drivebound connections require https");
+  }
+  if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error("Enter the server origin without credentials, a query, or a fragment");
+  }
+  parsed.pathname = parsed.pathname.replace(/\/$/, "");
+  return parsed.toString().replace(/\/$/, "");
 }
 
 export async function connection() {
@@ -29,6 +70,12 @@ export async function connection() {
   ]);
   if (!server || !token) throw new Error("Connect this device first");
   return { server, token, deviceId };
+}
+
+export async function connectionScope(): Promise<string> {
+  const { deviceId } = await connection();
+  if (!deviceId) throw new Error("Reconnect this device before starting a backup");
+  return deviceId;
 }
 
 export async function isConnected(): Promise<boolean> {
@@ -46,21 +93,36 @@ export async function deviceFetch(path: string, init: RequestInit = {}): Promise
   const { server, token } = await connection();
   const headers = new Headers(init.headers);
   headers.set("X-Device-Token", token);
-  return fetch(pathFor(server, path), { ...init, headers });
+  try {
+    return await fetch(pathFor(server, path), { ...init, headers });
+  } catch (error) {
+    throw new DriveboundApiError(`Cannot reach Drivebound at ${server}. Check the server address and connection. ${String(error)}`);
+  }
 }
 
 export async function apiJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await deviceFetch(path, init);
   if (!response.ok) {
     let detail = "Drivebound request failed";
-    try { detail = (await response.json()).detail ?? detail; } catch { /* response was not JSON */ }
-    throw new Error(detail);
+    try {
+      const body = await response.json() as { detail?: unknown };
+      if (typeof body.detail === "string") detail = body.detail;
+    } catch { /* response was not JSON */ }
+    throw new DriveboundApiError(detail, response.status);
   }
   return response.json() as Promise<T>;
 }
 
-export async function timeline(cursor?: string): Promise<TimelinePage> {
-  return apiJson<TimelinePage>(`/api/v1/assets?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+export async function timeline(cursor?: string, limit = 100): Promise<TimelinePage> {
+  return apiJson<TimelinePage>(`/api/v1/assets?limit=${Math.max(1, Math.min(200, limit))}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+}
+
+export async function assetDetail(assetId: string): Promise<AssetDetail> {
+  return apiJson<AssetDetail>(`/api/v1/assets/${assetId}`);
+}
+
+export async function verifyConnection(): Promise<void> {
+  await timeline(undefined, 1);
 }
 
 export async function search(query: string): Promise<TimelineAsset[]> {
@@ -95,6 +157,10 @@ export async function restoreToPhone(asset: TimelineAsset): Promise<void> {
   const filename = (asset.original_filename || `${asset.id}.${asset.mime_type.startsWith("video/") ? "mp4" : "jpg"}`).replace(/[^A-Za-z0-9._-]/g, "_");
   const target = `${FileSystem.cacheDirectory ?? FileSystem.documentDirectory}drivebound-${Date.now()}-${filename}`;
   const result = await FileSystem.downloadAsync(pathFor(server, asset.original_url), target, { headers: { "X-Device-Token": token } });
+  if (result.status < 200 || result.status >= 300) {
+    await FileSystem.deleteAsync(result.uri, { idempotent: true });
+    throw new DriveboundApiError(`Could not download the original (${result.status})`, result.status);
+  }
   await MediaLibrary.saveToLibraryAsync(result.uri);
   await FileSystem.deleteAsync(result.uri, { idempotent: true });
 }

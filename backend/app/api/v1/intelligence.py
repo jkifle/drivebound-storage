@@ -26,7 +26,7 @@ async def semantic_search(
     query_vector = await asyncio.to_thread(embed_text, query, True)
     distance = Asset.embedding.cosine_distance(query_vector).label("distance")
     ranked = (await session.execute(select(Asset, distance).where(
-        Asset.user_id == user.id, Asset.embedding.is_not(None)
+        Asset.user_id == user.id, Asset.lifecycle_state == "active", Asset.embedding.is_not(None)
     ).order_by(distance).limit(limit))).all()
     return [SemanticResult(score=max(0.0, 1.0 - float(score)), excerpt=(asset.ocr_text or asset.semantic_text or "")[:240], asset=timeline_item(asset)) for asset, score in ranked]
 
@@ -36,7 +36,7 @@ async def reindex(
     session: AsyncSession = Depends(get_db),
     user: User = Depends(current_user_or_device),
 ) -> ReindexResponse:
-    asset_ids = (await session.scalars(select(Asset.id).where(Asset.user_id == user.id))).all()
+    asset_ids = (await session.scalars(select(Asset.id).where(Asset.user_id == user.id, Asset.lifecycle_state == "active"))).all()
     for asset_id in asset_ids:
         index_asset_task.delay(str(asset_id))
     return ReindexResponse(queued=len(asset_ids))

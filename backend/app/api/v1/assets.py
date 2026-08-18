@@ -7,7 +7,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.security import current_user_or_device
+from app.core.security import current_user, current_user_or_device
 from app.db.session import get_db
 from app.models.asset import Asset
 from app.models.album import Album, AlbumAsset, AlbumMember
@@ -17,6 +17,9 @@ from app.schemas.asset import AssetResponse, TimelineAssetResponse, TimelineResp
 from app.services.ingestion import persist_managed_asset
 from app.services.media_delivery import media_response
 from app.services.storage import stage_upload, validated_external_path, validated_storage_path
+from app.services.lifecycle import restore_asset_from_trash, rollback_asset, trash_asset
+from app.schemas.lifecycle import AssetRevisionResponse, TrashResponse
+from app.worker.tasks import purge_expired_assets_task
 from app.services.timeline import TimelineCursor, decode_cursor, encode_cursor
 from app.worker.tasks import process_asset_task, protect_asset_task, restore_asset_task
 
@@ -36,6 +39,7 @@ async def readable_asset(session: AsyncSession, user_id: uuid.UUID, asset_id: uu
         .outerjoin(AlbumMember, AlbumMember.album_id == Album.id, full=False)
         .where(
             Asset.id == asset_id,
+            Asset.lifecycle_state == "active",
             or_(Asset.user_id == user_id, Album.user_id == user_id, AlbumMember.user_id == user_id),
         )
         .distinct()
@@ -44,7 +48,7 @@ async def readable_asset(session: AsyncSession, user_id: uuid.UUID, asset_id: uu
 
 def timeline_statement(user_id: uuid.UUID, limit: int, cursor: TimelineCursor | None = None):
     timeline_at = func.coalesce(Asset.taken_at, Asset.created_at)
-    statement = select(Asset).where(Asset.user_id == user_id)
+    statement = select(Asset).where(Asset.user_id == user_id, Asset.lifecycle_state == "active")
     if cursor is not None:
         statement = statement.where(
             or_(
@@ -77,6 +81,138 @@ def timeline_item(asset: Asset) -> TimelineAssetResponse:
         protection_status=asset.protection_status,
         restore_status=asset.restore_status,
     )
+
+
+def revision_item(asset: Asset) -> AssetRevisionResponse:
+    return AssetRevisionResponse(
+        id=asset.id, logical_id=asset.logical_id, version=asset.version, lifecycle_state=asset.lifecycle_state,
+        original_filename=asset.original_filename, checksum=asset.checksum, file_size=asset.file_size,
+        created_at=asset.created_at, superseded_at=asset.superseded_at, trashed_at=asset.trashed_at,
+        purge_after=asset.purge_after,
+    )
+
+
+@router.get("/trash", response_model=list[TrashResponse])
+async def list_trash(
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(current_user),
+) -> list[TrashResponse]:
+    assets = list((await session.scalars(
+        select(Asset).where(Asset.user_id == user.id, Asset.lifecycle_state == "trashed").order_by(Asset.trashed_at.desc())
+    )).all())
+    return [TrashResponse(**revision_item(asset).model_dump()) for asset in assets]
+
+
+@router.post("/{asset_id}/trash", response_model=TrashResponse)
+async def move_to_trash(
+    asset_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(current_user),
+) -> TrashResponse:
+    asset = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id, Asset.lifecycle_state == "active"))
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    try:
+        asset = await trash_asset(session, asset, actor="web")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return TrashResponse(**revision_item(asset).model_dump())
+
+
+@router.delete("/{asset_id}", response_model=TrashResponse)
+async def delete_asset(
+    asset_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(current_user),
+) -> TrashResponse:
+    """Delete is intentionally reversible until the retention deadline."""
+    asset = await session.scalar(
+        select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id, Asset.lifecycle_state == "active")
+    )
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Active asset not found")
+    try:
+        asset = await trash_asset(session, asset, actor="web")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return TrashResponse(**revision_item(asset).model_dump())
+
+
+@router.post("/{asset_id}/restore-from-trash", response_model=AssetRevisionResponse)
+async def restore_from_trash(
+    asset_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(current_user),
+) -> AssetRevisionResponse:
+    asset = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    try:
+        asset = await restore_asset_from_trash(session, asset, actor="web")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return revision_item(asset)
+
+
+@router.get("/{asset_id}/versions", response_model=list[AssetRevisionResponse])
+async def asset_versions(
+    asset_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(current_user),
+) -> list[AssetRevisionResponse]:
+    asset = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    revisions = list((await session.scalars(
+        select(Asset)
+        .where(Asset.user_id == user.id, Asset.logical_id == asset.logical_id)
+        .order_by(Asset.version.desc(), Asset.created_at.desc())
+    )).all())
+    return [revision_item(revision) for revision in revisions]
+
+
+@router.post("/{asset_id}/rollback/{version_id}", response_model=AssetRevisionResponse)
+async def rollback_to_version(
+    asset_id: uuid.UUID,
+    version_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(current_user),
+) -> AssetRevisionResponse:
+    current = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
+    target = await session.scalar(select(Asset).where(Asset.id == version_id, Asset.user_id == user.id))
+    if current is None or target is None:
+        raise HTTPException(status_code=404, detail="Asset revision not found")
+    try:
+        restored = await rollback_asset(session, current, target, actor="web")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return revision_item(restored)
+
+
+@router.post("/{asset_id}/purge", status_code=status.HTTP_202_ACCEPTED)
+async def purge_when_retained(
+    asset_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+    user: User = Depends(current_user),
+) -> dict[str, str]:
+    asset = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    if asset.lifecycle_state != "trashed":
+        raise HTTPException(status_code=409, detail="Move the asset to trash before requesting permanent deletion")
+    if asset.purge_after is None:
+        raise HTTPException(status_code=409, detail="The asset has no retention deadline")
+    if asset.purge_after > datetime.now(timezone.utc):
+        raise HTTPException(status_code=409, detail="The retention period has not elapsed")
+    try:
+        purge_expired_assets_task.delay(str(asset.id))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Permanent deletion could not be queued") from exc
+    return {"status": "queued", "asset_id": str(asset.id)}
 
 
 @router.get("", response_model=TimelineResponse)
@@ -220,10 +356,21 @@ async def restore_asset_copy(
     session: AsyncSession = Depends(get_db),
     user: User = Depends(current_user_or_device),
 ) -> Asset:
-    asset = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
+    asset = await session.scalar(select(Asset).where(
+        Asset.id == asset_id,
+        Asset.user_id == user.id,
+        Asset.lifecycle_state == "active",
+    ))
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
-    if asset.protection_status != "protected":
+    usable_replica = await session.scalar(
+        select(AssetReplica.id).where(
+            AssetReplica.asset_id == asset.id,
+            AssetReplica.status == "verified",
+            AssetReplica.verification_status == "verified",
+        ).limit(1)
+    )
+    if usable_replica is None:
         raise HTTPException(status_code=409, detail="A verified protection copy is required before restore")
     asset.restore_status = "queued"
     await session.commit()

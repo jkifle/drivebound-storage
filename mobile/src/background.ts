@@ -8,7 +8,7 @@ TaskManager.defineTask(BACKUP_TASK, async () => {
   try {
     const policy = await loadBackupPolicy();
     if (!policy.automatic) return BackgroundTask.BackgroundTaskResult.Success;
-    await runBackup();
+    await runBackup(undefined, { mode: "background" });
     return BackgroundTask.BackgroundTaskResult.Success;
   }
   catch { return BackgroundTask.BackgroundTaskResult.Failed; }

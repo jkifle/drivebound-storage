@@ -6,6 +6,7 @@ const POLICY_KEY = "drivebound.backupPolicy.v2";
 
 export type BackupPolicy = {
   automatic: boolean;
+  paused: boolean;
   wifiOnly: boolean;
   chargingOnly: boolean;
   bandwidthKbps: number;
@@ -15,6 +16,7 @@ export type BackupPolicy = {
 
 export const defaultBackupPolicy: BackupPolicy = {
   automatic: false,
+  paused: false,
   wifiOnly: true,
   chargingOnly: false,
   bandwidthKbps: 0,
@@ -25,8 +27,11 @@ export const defaultBackupPolicy: BackupPolicy = {
 export async function loadBackupPolicy(): Promise<BackupPolicy> {
   const raw = await AsyncStorage.getItem(POLICY_KEY);
   if (!raw) return defaultBackupPolicy;
-  try { return { ...defaultBackupPolicy, ...JSON.parse(raw) }; }
-  catch { return defaultBackupPolicy; }
+  try {
+    return { ...defaultBackupPolicy, ...JSON.parse(raw) };
+  } catch {
+    return defaultBackupPolicy;
+  }
 }
 
 export async function saveBackupPolicy(policy: BackupPolicy): Promise<void> {
@@ -46,21 +51,53 @@ function inScheduledWindow(policy: BackupPolicy, now = new Date()): boolean {
   return start < end ? hour >= start && hour < end : hour >= start || hour < end;
 }
 
-export async function backupPolicyBlocker(policy?: BackupPolicy): Promise<string | null> {
+export async function backupPolicyBlocker(
+  policy?: BackupPolicy,
+  options: { mode?: "manual" | "background" } = {},
+): Promise<string | null> {
   const activePolicy = policy ?? await loadBackupPolicy();
-  if (!inScheduledWindow(activePolicy)) return `Scheduled for ${String(activePolicy.scheduleStartHour).padStart(2, "0")}:00–${String(activePolicy.scheduleEndHour).padStart(2, "0")}:00`;
+  if (activePolicy.paused) return "Backup is paused";
+  if (options.mode === "background" && !inScheduledWindow(activePolicy)) {
+    return `Scheduled for ${String(activePolicy.scheduleStartHour).padStart(2, "0")}:00-${String(activePolicy.scheduleEndHour).padStart(2, "0")}:00`;
+  }
   const network = await Network.getNetworkStateAsync();
-  if (network.isInternetReachable === false || !network.isConnected) return "Waiting for an internet connection";
-  if (activePolicy.wifiOnly && network.type !== Network.NetworkStateType.WIFI && network.type !== Network.NetworkStateType.ETHERNET) return "Waiting for Wi-Fi";
+  // A self-hosted server may be reachable over the LAN while the phone has no
+  // route to the public internet, so connectivity is the meaningful signal.
+  if (!network.isConnected) return "Waiting for a network connection";
+  if (
+    activePolicy.wifiOnly
+    && network.type !== Network.NetworkStateType.WIFI
+    && network.type !== Network.NetworkStateType.ETHERNET
+  ) return "Waiting for Wi-Fi";
   if (activePolicy.chargingOnly) {
     const battery = await Battery.getBatteryStateAsync();
-    if (battery !== Battery.BatteryState.CHARGING && battery !== Battery.BatteryState.FULL) return "Waiting until the phone is charging";
+    if (battery !== Battery.BatteryState.CHARGING && battery !== Battery.BatteryState.FULL) {
+      return "Waiting until the phone is charging";
+    }
   }
   return null;
 }
 
-export async function throttleForBandwidth(bytes: number, bandwidthKbps: number): Promise<void> {
+export async function networkStatusLabel(): Promise<string> {
+  const network = await Network.getNetworkStateAsync();
+  if (!network.isConnected) return "Offline";
+  if (network.type === Network.NetworkStateType.WIFI) return "Wi-Fi connected";
+  if (network.type === Network.NetworkStateType.ETHERNET) return "Ethernet connected";
+  if (network.type === Network.NetworkStateType.CELLULAR) return "Cellular connected";
+  return "Network connected";
+}
+
+export async function throttleForBandwidth(
+  bytes: number,
+  bandwidthKbps: number,
+  heartbeat?: () => Promise<void>,
+): Promise<void> {
   if (bandwidthKbps <= 0) return;
-  const milliseconds = Math.ceil((bytes * 8 * 1000) / (bandwidthKbps * 1000));
-  if (milliseconds > 0) await new Promise<void>(resolve => setTimeout(resolve, milliseconds));
+  let milliseconds = Math.ceil((bytes * 8 * 1000) / (bandwidthKbps * 1000));
+  while (milliseconds > 0) {
+    const interval = Math.min(milliseconds, 30_000);
+    await new Promise<void>(resolve => setTimeout(resolve, interval));
+    milliseconds -= interval;
+    if (heartbeat) await heartbeat();
+  }
 }

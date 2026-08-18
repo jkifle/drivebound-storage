@@ -130,6 +130,22 @@ def validated_external_path(stored_path: str) -> Path:
     return path
 
 
+def validated_replica_drive_path(stored_path: str) -> Path:
+    """Resolve a configured replica drive without allowing arbitrary host paths."""
+    path = Path(stored_path).resolve()
+    if not any(path.is_relative_to(root) for root in settings.replica_root_list):
+        raise HTTPException(status_code=400, detail="Path is outside the configured replica-drive roots")
+    return path
+
+
+def validated_backup_path(stored_path: str) -> Path:
+    path = Path(stored_path).resolve()
+    root = settings.backups_path.resolve()
+    if not path.is_relative_to(root):
+        raise HTTPException(status_code=500, detail="Backup path is outside the configured backup root")
+    return path
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:

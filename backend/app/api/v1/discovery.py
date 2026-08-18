@@ -64,7 +64,7 @@ async def list_files(
     session: AsyncSession = Depends(get_db),
     user: User = Depends(current_user_or_device),
 ) -> list[FileItem]:
-    statement = select(Asset).where(Asset.user_id == user.id)
+    statement = select(Asset).where(Asset.user_id == user.id, Asset.lifecycle_state == "active")
     if path:
         statement = statement.where(Asset.relative_path.startswith(path))
     if query:
@@ -86,6 +86,7 @@ async def search_assets(
             select(Asset)
             .where(
                 Asset.user_id == user.id,
+                Asset.lifecycle_state == "active",
                 or_(
                     Asset.original_filename.ilike(pattern),
                     Asset.relative_path.ilike(pattern),
@@ -113,7 +114,7 @@ async def map_assets(
     assets = (
         await session.scalars(
             select(Asset)
-            .where(Asset.user_id == user.id, Asset.latitude.is_not(None), Asset.longitude.is_not(None))
+            .where(Asset.user_id == user.id, Asset.lifecycle_state == "active", Asset.latitude.is_not(None), Asset.longitude.is_not(None))
             .order_by(func.coalesce(Asset.taken_at, Asset.created_at).desc())
             .limit(limit)
         )
@@ -140,6 +141,7 @@ async def memories(
     today = datetime.now(timezone.utc)
     assets = (await session.scalars(select(Asset).where(
         Asset.user_id == user.id,
+        Asset.lifecycle_state == "active",
         func.extract("month", func.coalesce(Asset.taken_at, Asset.created_at)) == today.month,
         func.extract("day", func.coalesce(Asset.taken_at, Asset.created_at)) == today.day,
         func.extract("year", func.coalesce(Asset.taken_at, Asset.created_at)) < today.year,
@@ -181,7 +183,7 @@ async def list_albums(
         cover = await session.scalar(
             select(Asset)
             .join(AlbumAsset, AlbumAsset.asset_id == Asset.id)
-            .where(AlbumAsset.album_id == album.id)
+            .where(AlbumAsset.album_id == album.id, Asset.lifecycle_state == "active")
             .order_by(func.coalesce(Asset.taken_at, Asset.created_at).desc())
             .limit(1)
         )
@@ -252,7 +254,7 @@ async def list_album_assets(
         await session.scalars(
             select(Asset)
             .join(AlbumAsset, AlbumAsset.asset_id == Asset.id)
-            .where(AlbumAsset.album_id == album_id)
+            .where(AlbumAsset.album_id == album_id, Asset.lifecycle_state == "active")
             .order_by(func.coalesce(Asset.taken_at, Asset.created_at).desc())
         )
     ).all()
