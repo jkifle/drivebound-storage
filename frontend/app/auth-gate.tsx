@@ -19,6 +19,40 @@ function Brand() {
   return <div className="brand"><span className="brand-mark" aria-hidden="true">D</span><span>Drivebound</span></div>;
 }
 
+function DirectoryPathField({ value, onChange }: { value: string; onChange: (next: string) => void }) {
+  const pickerId = useId();
+  const [pickerKey, setPickerKey] = useState(0);
+
+  const handleSelect = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const relative = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+    const folder = relative ? relative.split("/").slice(0, -1).join("/") : file.name;
+    onChange(folder || value || "/data/imports");
+    setPickerKey((current) => current + 1);
+  };
+
+  return <>
+    <div className="folder-input-wrap">
+      <input value={value} onChange={(event) => onChange(event.target.value)} aria-label="Media folder path" />
+      <button type="button" className="secondary-button" onClick={() => {
+        const input = document.getElementById(pickerId) as HTMLInputElement | null;
+        if (input) input.click();
+      }}>Choose folder</button>
+    </div>
+    <input
+      key={pickerKey}
+      id={pickerId}
+      type="file"
+      hidden
+      webkitdirectory="true"
+      directory="true"
+      multiple={false}
+      onChange={handleSelect}
+    />
+  </>;
+}
+
 function Onboarding({ user, onComplete }: { user: DriveboundUser; onComplete: (user: DriveboundUser) => void }) {
   const [step, setStep] = useState(1);
   const [name, setName] = useState(user.display_name ?? "");

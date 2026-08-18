@@ -5,6 +5,7 @@ import {
   ChangeEvent,
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -146,6 +147,48 @@ type ExternalLibrary = {
 type TimelineRow =
   | { kind: "heading"; day: string; id: string }
   | { kind: "photos"; assets: TimelineAsset[]; id: string };
+
+function DirectoryPathField({ value, onChange }: { value: string; onChange: (next: string) => void }) {
+  const pickerId = useId();
+  const [pickerKey, setPickerKey] = useState(0);
+
+  const handleSelect = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const relative = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+    const folder = relative ? relative.split("/").slice(0, -1).join("/") : file.name;
+    onChange(folder || value || "/data/imports");
+    setPickerKey((current) => current + 1);
+  };
+
+  return (
+    <>
+      <div className="folder-input-wrap">
+        <input value={value} onChange={(event) => onChange(event.target.value)} aria-label="Media folder path" />
+        <button
+          type="button"
+          className="secondary-button"
+          onClick={() => {
+            const input = document.getElementById(pickerId) as HTMLInputElement | null;
+            if (input) input.click();
+          }}
+        >
+          Choose folder
+        </button>
+      </div>
+      <input
+        key={pickerKey}
+        id={pickerId}
+        type="file"
+        hidden
+        webkitdirectory="true"
+        directory="true"
+        multiple={false}
+        onChange={handleSelect}
+      />
+    </>
+  );
+}
 
 function apiUrl(path: string) {
   return path.startsWith("http") ? path : `${API_URL}${path}`;
