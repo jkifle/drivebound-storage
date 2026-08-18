@@ -23,7 +23,7 @@
     "expo-sqlite": "~57.0.1",
     "expo-task-manager": "~57.0.9",
     "expo-video": "~57.0.2",
-    "react": "19.2.3",
+    "react": "19.2.8",
     "react-native": "0.86.0",
     "react-native-safe-area-context": "~5.7.0"
   },
