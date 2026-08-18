@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build backend image
         run: docker build -t drivebound-backend:${{ github.sha }} backend
       - name: Build frontend image
@@ -32,7 +32,7 @@ jobs:
         run: tar -czf drivebound-deployment-${{ github.sha }}.tgz docker-compose.yml docker-compose.production.yml docs/operations
       - name: Create artifact checksum
         run: sha256sum drivebound-deployment-${{ github.sha }}.tgz > drivebound-deployment-${{ github.sha }}.tgz.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: drivebound-deployment-${{ github.sha }}
           path: |
