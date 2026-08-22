@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.asset import Asset
 from app.models.sync import SyncConflict, SyncItem, SyncOperation, SyncRoot
+from app.models.user import User
 from app.schemas.sync import SyncOperationInput
 from app.services.lifecycle import audit, trash_asset
 
@@ -20,6 +21,8 @@ _REVISION_IDENTITY_COLUMNS = {
 
 def clone_asset_revision(source: Asset, logical_id: uuid.UUID, version: int) -> Asset:
     """Create another immutable catalog revision that safely shares content-addressed bytes."""
+    if source.lifecycle_state not in {"active", "superseded"}:
+        raise ValueError("An asset being deleted cannot be cloned or reactivated")
     values = {
         column.name: getattr(source, column.name)
         for column in Asset.__table__.columns
@@ -63,7 +66,11 @@ async def _apply_item_operation(
         if input.asset_id is None or input.relative_path is None:
             raise ValueError("An upsert needs an uploaded asset and relative path")
         asset = await session.scalar(
-            select(Asset).where(Asset.id == input.asset_id, Asset.user_id == root.user_id).with_for_update()
+            select(Asset).where(
+                Asset.id == input.asset_id,
+                Asset.user_id == root.user_id,
+                Asset.lifecycle_state == "active",
+            ).with_for_update()
         )
         if asset is None:
             raise ValueError("The uploaded asset is unavailable")
@@ -132,18 +139,36 @@ async def _apply_item_operation(
     elif input.kind == "move":
         if item is None or item.deleted_at is not None or input.relative_path is None:
             raise ValueError("A move needs an existing, live sync item and relative path")
+        asset = None
+        if item.asset_id is not None:
+            asset = await session.scalar(
+                select(Asset).where(
+                    Asset.id == item.asset_id,
+                    Asset.user_id == root.user_id,
+                    Asset.lifecycle_state == "active",
+                ).with_for_update()
+            )
+            if asset is None:
+                raise ValueError("The synchronized asset is being deleted")
         item.relative_path = input.relative_path
         item.revision = operation.revision or ""
-        operation.payload = operation_payload(input, await session.get(Asset, item.asset_id) if item.asset_id else None)
+        operation.payload = operation_payload(input, asset)
     else:  # delete
         if item is None:
             item = SyncItem(root_id=root.id, logical_id=input.logical_id, asset_id=None, relative_path=input.relative_path or "", revision=operation.revision or "")
             session.add(item)
         else:
             if item.asset_id:
-                asset = await session.get(Asset, item.asset_id)
-                if asset and asset.lifecycle_state == "active":
-                    asset = await trash_asset(session, asset, actor=f"sync:{operation.client_id}")
+                asset = await session.scalar(
+                    select(Asset).where(
+                        Asset.id == item.asset_id,
+                        Asset.user_id == root.user_id,
+                        Asset.lifecycle_state == "active",
+                    ).with_for_update()
+                )
+                if asset is None:
+                    raise ValueError("The synchronized asset is being deleted")
+                await trash_asset(session, asset, actor=f"sync:{operation.client_id}")
             item.deleted_at = datetime.now(timezone.utc)
             item.revision = operation.revision or ""
         operation.payload = {"relative_path": item.relative_path, "deleted": True}
@@ -156,7 +181,26 @@ async def apply_operations(
     client_id: str,
     inputs: list[SyncOperationInput],
 ) -> tuple[list[SyncOperation], list[SyncConflict]]:
-    locked_root = await session.scalar(select(SyncRoot).where(SyncRoot.id == root.id).with_for_update())
+    # Account deletion takes ``FOR UPDATE`` on User before changing any child
+    # rows. Every stale sync writer takes the conflicting share lock first, so
+    # deletion either waits for this transaction or wins and makes the writer
+    # fail closed before it can lock a root or reactivate an asset.
+    active_user = await session.scalar(
+        select(User)
+        .where(User.id == root.user_id, User.disabled_at.is_(None))
+        .with_for_update(read=True)
+    )
+    if active_user is None:
+        raise ValueError("Account is unavailable")
+    locked_root = await session.scalar(
+        select(SyncRoot)
+        .where(
+            SyncRoot.id == root.id,
+            SyncRoot.user_id == active_user.id,
+            SyncRoot.status == "active",
+        )
+        .with_for_update()
+    )
     if locked_root is None:
         raise ValueError("Sync root is unavailable")
     root = locked_root
@@ -228,11 +272,43 @@ async def apply_operations(
 
 
 async def resolve_conflict(session: AsyncSession, conflict: SyncConflict, choice: str) -> SyncConflict:
+    # Discovering the owner is an unlocked read. The first row lock is always
+    # User, followed by SyncRoot and then conflict/item/asset rows.
+    owner_id = await session.scalar(select(SyncRoot.user_id).where(SyncRoot.id == conflict.root_id))
+    if owner_id is None:
+        raise ValueError("Sync conflict is incomplete")
+    active_user = await session.scalar(
+        select(User)
+        .where(User.id == owner_id, User.disabled_at.is_(None))
+        .with_for_update(read=True)
+    )
+    if active_user is None:
+        raise ValueError("Account is unavailable")
+    root = await session.scalar(
+        select(SyncRoot)
+        .where(
+            SyncRoot.id == conflict.root_id,
+            SyncRoot.user_id == active_user.id,
+            SyncRoot.status == "active",
+        )
+        .with_for_update()
+    )
+    if root is None:
+        raise ValueError("Sync conflict is incomplete")
+    locked_conflict = await session.scalar(
+        select(SyncConflict).where(SyncConflict.id == conflict.id, SyncConflict.root_id == root.id).with_for_update()
+    )
+    if locked_conflict is None:
+        raise ValueError("Sync conflict is incomplete")
+    conflict = locked_conflict
     if conflict.status != "open":
         return conflict
-    operation = await session.get(SyncOperation, conflict.local_operation_id)
-    root = await session.get(SyncRoot, conflict.root_id)
-    if operation is None or root is None:
+    operation = await session.scalar(
+        select(SyncOperation)
+        .where(SyncOperation.id == conflict.local_operation_id, SyncOperation.root_id == root.id)
+        .with_for_update()
+    )
+    if operation is None:
         raise ValueError("Sync conflict is incomplete")
     if choice == "keep_local":
         payload = operation.payload
@@ -242,14 +318,22 @@ async def resolve_conflict(session: AsyncSession, conflict: SyncConflict, choice
             relative_path=payload.get("relative_path") if isinstance(payload.get("relative_path"), str) else None,
             asset_id=uuid.UUID(str(payload["asset_id"])) if payload.get("asset_id") else None,
         )
-        item = await session.scalar(select(SyncItem).where(SyncItem.root_id == root.id, SyncItem.logical_id == operation.logical_id))
+        item = await session.scalar(
+            select(SyncItem)
+            .where(SyncItem.root_id == root.id, SyncItem.logical_id == operation.logical_id)
+            .with_for_update()
+        )
         await _apply_item_operation(session, root, operation, input, item)
         # The conflicted operation may already have been pulled by peers. Give
         # its resolved form a new cursor so reconnecting clients receive it.
         root.cursor += 1
         operation.cursor = root.cursor
         operation.revision = next_revision(root.cursor, operation.operation_id)
-        item = await session.scalar(select(SyncItem).where(SyncItem.root_id == root.id, SyncItem.logical_id == operation.logical_id))
+        item = await session.scalar(
+            select(SyncItem)
+            .where(SyncItem.root_id == root.id, SyncItem.logical_id == operation.logical_id)
+            .with_for_update()
+        )
         if item is not None:
             item.revision = operation.revision
         operation.status = "applied"

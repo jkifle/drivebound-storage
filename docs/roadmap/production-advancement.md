@@ -1,21 +1,30 @@
 # Drivebound production advancement roadmap
 
-Last reconciled with the repository on 2026-08-15. This document separates
+Last reconciled with the repository on 2026-08-22. Drivebound is in late
+Tranche A and partial Tranche B: daily-use behavior is present at the
+application layer, while production security, recovery, deletion, mobile, and
+operator acceptance are not all closed. This document separates
 delivered behavior from operator or environment acceptance. **Implemented**
 means the capability is present and has local automated evidence. **Partial**
 means useful implementation is present, but a required integration, deployment,
 or recovery gate has not yet been demonstrated.
 
-The current validation baseline is 71 focused backend tests covering mobile
-contracts, lifecycle and sync, node attestation, observability, operational
-metrics, and structural recovery evidence; the frontend production build and
-mobile TypeScript type check also pass. This is not evidence of a live isolated
-restore, a real-authenticator WebAuthn browser matrix, app-store delivery, or a
-hosted relay deployment.
+Local automated suites cover mobile contracts, lifecycle and sync, node
+attestation, observability, operational metrics, structural recovery evidence,
+authentication hardening, and durable account deletion. The current local
+baseline is 161 passing backend tests with one platform-dependent link test
+skipped, a passing frontend lint and production build, a passing mobile
+typecheck, and clean offline upgrade/downgrade SQL through the single `0017`
+migration head. Local tests are not evidence of a live isolated restore,
+deletion replay from a historical archive, complete physical erasure, a
+real-authenticator WebAuthn browser matrix, physical-device/app-store delivery,
+production alert delivery, or a hosted relay deployment.
 
 ## Tranche A - reliable daily use
 
-**Status: implemented and locally validated.**
+**Status: late; core workflows are implemented with local automated evidence,
+while physical-device, real-drive, and restore acceptance remain external
+gates.**
 
 - The native client uses a durable, device-scoped SQLite transfer queue with
   resumable offsets, bounded retry, expired-lease recovery, slow-transfer lease
@@ -47,15 +56,27 @@ acceptance remains.**
   verification and repair controls, redacted structural recovery-input evidence,
   a scheduler/CI wrapper, append-only reports, and bounded failure-injection
   fixtures.
-- **Implemented, final integration validation in progress:** WebAuthn/passkey
+- **Implemented and locally validated:** WebAuthn/passkey
   sign-in and credential management, password/passkey/Google reauthentication,
   recent-authentication enforcement for high-risk account actions, and
-  capability-aware sign-in and profile journeys. The frontend production build
-  passes; full backend, migration, OAuth-callback, and physical-authenticator
-  acceptance must pass before release.
+  capability-aware sign-in and profile journeys. The backend tests and frontend
+  production build pass; real Google OAuth and the physical-authenticator
+  browser matrix remain release gates.
 - **Implemented and locally validated:** Ed25519 node attestation, replay and
   freshness checks, legacy-node repair, and opaque node-secret rotation.
+  The supported node is the dependency-free `tools/drivebound_node.py` client;
+  the incompatible experimental standalone `node_service` package was removed.
   Signed node software updates and identity-key rotation are not implemented.
+- **Implemented and locally validated; operator acceptance remains:** migration `0017`
+  adds durable, leased, retrying account-deletion jobs and an independent HMAC
+  suppression ledger replayed before API traffic after a restore. Live access,
+  credentials, and the live media key are destroyed at acceptance; catalog-owned
+  managed bytes are then removed asynchronously. Canonical cross-kind reference
+  protection, account-scoped orphan and staging sweeps, writer fences, and a
+  retained `manual_review` state are implemented. Historical archives are not
+  instantly erased and external-library originals remain read-only. Production
+  still needs a live ledger-replay/deletion drill and retained operator evidence.
+  See the [account-deletion runbook](../operations/account-deletion.md).
 - **Partial:** the recovery runbook and automation deliberately prove only that
   approved inputs are checksum-valid and structurally readable. No isolated
   PostgreSQL restore, application startup, ownership check, media decryption, or
@@ -72,9 +93,11 @@ acceptance remains.**
 
 Complete this tranche before adding more user-facing scope:
 
-1. Finish the passkey/recent-auth backend tests, inspect migration upgrade and
-   downgrade SQL, and exercise password, Google, passkey, MFA, recovery-code,
-   session-revocation, export, and account-deletion journeys end to end.
+1. Run the locally validated authentication and deletion contracts against the
+   release environment: live PostgreSQL and Redis/Celery, real Google OAuth and
+   SMTP, broker failure, worker restart, filesystem outage, suppression-ledger
+   replay, legacy paths, and orphan-byte inventory. Retain the resulting
+   password, MFA, recovery, revocation, export, and deletion evidence.
 2. Run the WebAuthn flows with real platform and roaming authenticators across
    the supported browser/device matrix, including cancellation, expired
    challenges, lost credentials, and account-recovery fallback.

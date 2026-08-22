@@ -6,7 +6,7 @@ from sqlalchemy import Text, cast, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.assets import timeline_item
-from app.core.security import current_user_or_device
+from app.core.security import current_user_or_device, reject_suppressed_account
 from app.db.session import get_db
 from app.core.config import settings
 from app.core.security import opaque_token, token_digest
@@ -25,6 +25,12 @@ async def album_role(session: AsyncSession, album_id: uuid.UUID, user_id: uuid.U
     album = await session.get(Album, album_id)
     if album is None:
         return None
+    try:
+        reject_suppressed_account(album.user_id)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            return None
+        raise
     if album.user_id == user_id:
         return album, "owner"
     member = await session.get(AlbumMember, (album_id, user_id))
@@ -102,7 +108,16 @@ async def search_assets(
             .limit(limit)
         )
     ).all()
-    return [timeline_item(asset) for asset in assets]
+    visible = []
+    for asset in assets:
+        try:
+            reject_suppressed_account(asset.user_id)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+                continue
+            raise
+        visible.append(timeline_item(asset))
+    return visible
 
 
 @router.get("/map", response_model=list[MapItem])
@@ -180,6 +195,8 @@ async def list_albums(
     results = []
     for album, count in rows:
         access = await album_role(session, album.id, user.id)
+        if access is None:
+            continue
         cover = await session.scalar(
             select(Asset)
             .join(AlbumAsset, AlbumAsset.asset_id == Asset.id)
@@ -187,6 +204,14 @@ async def list_albums(
             .order_by(func.coalesce(Asset.taken_at, Asset.created_at).desc())
             .limit(1)
         )
+        if cover is not None:
+            try:
+                reject_suppressed_account(cover.user_id)
+            except HTTPException as exc:
+                if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+                    cover = None
+                else:
+                    raise
         results.append(AlbumResponse(
             **AlbumResponse.model_validate(album).model_dump(exclude={"asset_count", "cover_thumbnail_url", "role"}),
             asset_count=count,
@@ -258,7 +283,16 @@ async def list_album_assets(
             .order_by(func.coalesce(Asset.taken_at, Asset.created_at).desc())
         )
     ).all()
-    return [timeline_item(asset) for asset in assets]
+    visible = []
+    for asset in assets:
+        try:
+            reject_suppressed_account(asset.user_id)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+                continue
+            raise
+        visible.append(timeline_item(asset))
+    return visible
 
 
 @router.delete("/albums/{album_id}/assets/{asset_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -297,6 +331,22 @@ async def accept_album_invite(token: str, session: AsyncSession = Depends(get_db
     invite = await session.scalar(select(AlbumInvite).where(AlbumInvite.token_hash == token_digest(token), AlbumInvite.accepted_at.is_(None), AlbumInvite.expires_at > now).with_for_update())
     if invite is None:
         raise HTTPException(status_code=400, detail="Invitation is invalid or expired")
+    invited_album = await session.get(Album, invite.album_id)
+    if invited_album is None:
+        raise HTTPException(status_code=400, detail="Invitation is invalid or expired")
+    try:
+        reject_suppressed_account(invited_album.user_id)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            raise HTTPException(status_code=400, detail="Invitation is invalid or expired") from None
+        raise
+    if invite.invited_by is not None:
+        try:
+            reject_suppressed_account(invite.invited_by)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+                raise HTTPException(status_code=400, detail="Invitation is invalid or expired") from None
+            raise
     if invite.email.lower() != user.email.lower():
         raise HTTPException(status_code=403, detail="Sign in with the invited email address")
     if await session.get(AlbumMember, (invite.album_id, user.id)) is None:
@@ -311,7 +361,20 @@ async def album_members(album_id: uuid.UUID, session: AsyncSession = Depends(get
     owner = await session.get(User, album.user_id)
     rows = (await session.execute(select(AlbumMember, User).join(User, User.id == AlbumMember.user_id).where(AlbumMember.album_id == album_id))).all()
     results = [AlbumMemberResponse(user_id=album.user_id, email=owner.email, display_name=owner.display_name, role="owner")]
-    results.extend(AlbumMemberResponse(user_id=member.user_id, email=member_user.email, display_name=member_user.display_name, role=member.role, joined_at=member.joined_at) for member, member_user in rows)
+    for member, member_user in rows:
+        try:
+            reject_suppressed_account(member.user_id)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+                continue
+            raise
+        results.append(AlbumMemberResponse(
+            user_id=member.user_id,
+            email=member_user.email,
+            display_name=member_user.display_name,
+            role=member.role,
+            joined_at=member.joined_at,
+        ))
     return results
 
 

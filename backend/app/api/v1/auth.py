@@ -17,9 +17,9 @@ from app.core.config import settings
 from app.core.security import (
     create_access_token, current_auth, current_user, decrypt_secret, encrypt_secret,
     hash_password, hash_password_async, opaque_token, raise_recent_auth_required, require_recent_auth,
-    session_has_recent_auth, token_digest, verify_password_async,
+    reject_suppressed_account, session_has_recent_auth, token_digest, verify_password_async,
 )
-from app.db.session import get_db
+from app.db.session import async_session_factory, get_db
 from app.models.album import Album
 from app.models.asset import Asset
 from app.models.auth import AccountToken, AuditEvent, AuthSession, ExternalIdentity, MfaRecoveryCode, PasskeyCredential
@@ -36,6 +36,12 @@ from app.schemas.auth import (
 from app.services.accounts import (
     create_account_token, deliver_account_email_safely, enforce_rate_limit, record_event, request_context,
     reset_rate_limit,
+)
+from app.services.account_deletion import (
+    prepare_account_deletion,
+    reconcile_suppression_ledger,
+    record_account_deletion_publish,
+    write_suppression_marker,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -188,6 +194,7 @@ async def issue_session(
     set_browser_cookies: bool = True,
     establish_recent_auth: bool = True,
 ) -> TokenResponse:
+    reject_suppressed_account(user.id)
     refresh = opaque_token(48)
     ip, agent = request_context(request)
     now = datetime.now(timezone.utc)
@@ -853,6 +860,12 @@ async def refresh_session(
         problem = JSONResponse(status_code=401, content={"detail": "Account is unavailable"})
         clear_cookies(problem)
         return problem
+    try:
+        reject_suppressed_account(user.id)
+    except HTTPException:
+        problem = JSONResponse(status_code=401, content={"detail": "Account is unavailable"})
+        clear_cookies(problem)
+        return problem
     replacement = opaque_token(48)
     auth_session.refresh_token_hash = token_digest(replacement)
     auth_session.last_seen_at = now
@@ -1181,7 +1194,7 @@ async def export_account(
     }
 
 
-@router.delete("/account", response_model=MessageResponse)
+@router.delete("/account", response_model=MessageResponse, status_code=status.HTTP_202_ACCEPTED)
 async def delete_account(
     payload: DeleteAccountRequest,
     request: Request,
@@ -1195,6 +1208,17 @@ async def delete_account(
         raise HTTPException(status_code=401, detail="Account is unavailable")
     if payload.confirmation != "DELETE MY ACCOUNT":
         raise HTTPException(status_code=400, detail="Confirmation is incorrect")
+    # A request that authenticated immediately before another deletion request
+    # committed can arrive here with an already-issued dependency result. Keep
+    # the operation idempotent without ever re-enabling or re-keying the user.
+    from app.models.account_deletion import AccountDeletionJob
+    existing_job = await db.scalar(
+        select(AccountDeletionJob).where(AccountDeletionJob.subject_id == user.id).with_for_update()
+    )
+    if existing_job is not None and user.disabled_at is not None:
+        await db.rollback()
+        clear_cookies(response)
+        return MessageResponse(message="Account deletion is already in progress.")
     proof_identity = f"sensitive-proof:{user.id}"
     if user.password_enabled:
         await enforce_rate_limit(request, proof_identity)
@@ -1211,15 +1235,69 @@ async def delete_account(
         raise HTTPException(status_code=400, detail="A valid two-factor code is required")
     if user.password_enabled:
         await reset_rate_limit(request, proof_identity)
-    await record_event(db, request, "account_deleted", user.id)
-    await db.flush()
-    await db.delete(user)
-    await db.commit()
+    job = await prepare_account_deletion(db, user)
+    try:
+        # The independent marker is authoritative across restoration of a
+        # pre-deletion pg_dump, so make it durable before committing the live
+        # database crypto-erasure.
+        await asyncio.to_thread(write_suppression_marker, job.id, user.id, job.requested_at)
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=503,
+            detail="Account deletion could not be durably recorded. Please try again.",
+        ) from None
+    try:
+        await db.commit()
+    except Exception:
+        # The suppression marker is already authoritative. A commit timeout is
+        # not a cancellation signal: reconcile immediately when possible, and
+        # otherwise let the scheduled ledger replay resume the accepted intent.
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        try:
+            # A commit failure can leave the dependency session unusable. The
+            # independent marker remains authoritative, so replay it through a
+            # fresh session and never let either rollback path alter the 202.
+            async with async_session_factory() as reconciliation_session:
+                await reconcile_suppression_ledger(reconciliation_session)
+                await reconciliation_session.commit()
+        except Exception:
+            pass
+        clear_cookies(response)
+        return MessageResponse(
+            message="Account deletion was durably accepted and will resume automatically."
+        )
     clear_cookies(response)
+    try:
+        from app.worker.tasks import cleanup_account_deletion_task
+        cleanup_account_deletion_task.delay(str(job.id))
+    except Exception:
+        try:
+            await record_account_deletion_publish(db, job.id, published=False)
+        except Exception:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+    else:
+        try:
+            await record_account_deletion_publish(db, job.id, published=True)
+        except Exception:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
     return MessageResponse(
         message=(
-            "Account and media-encryption keys deleted. Any retained orphaned media bytes are inaccessible; "
-            "physical storage cleanup is an administrator responsibility."
+            "Account access and the live media-encryption key were destroyed. "
+            "Drivebound is durably removing managed originals, derivatives, replicas, and staged uploads; "
+            "external-library originals are never deleted."
         )
     )
 

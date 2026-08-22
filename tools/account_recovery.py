@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import getpass
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,8 +20,11 @@ from app.models.auth import (
     PasskeyCredential,
     WebAuthnChallenge,
 )
+from app.models.account_deletion import AccountDeletionJob
 from app.models.device import Device
+from app.models.node import NodePairingCode, PairedNode
 from app.models.user import User
+from app.services.account_deletion import suppression_subject_is_denied
 
 
 async def recover(email: str, password: str) -> None:
@@ -29,6 +33,19 @@ async def recover(email: str, password: str) -> None:
         user = await db.scalar(select(User).where(User.email == email.lower()).with_for_update())
         if user is None:
             raise SystemExit("Account not found")
+        try:
+            suppressed = suppression_subject_is_denied(user.id)
+        except RuntimeError as exc:
+            raise SystemExit(
+                "Account recovery refused because deletion-suppression evidence cannot be verified"
+            ) from exc
+        if suppressed:
+            raise SystemExit("Account deletion is irreversible and cannot be recovered")
+        deletion = await db.scalar(
+            select(AccountDeletionJob.id).where(AccountDeletionJob.subject_id == user.id).limit(1)
+        )
+        if deletion is not None:
+            raise SystemExit("Account deletion is irreversible and cannot be recovered")
         now = datetime.now(timezone.utc)
         user.password_hash = replacement_hash
         user.password_enabled = True
@@ -50,6 +67,8 @@ async def recover(email: str, password: str) -> None:
             WebAuthnChallenge,
             PasskeyCredential,
             Device,
+            NodePairingCode,
+            PairedNode,
             ExternalIdentity,
         ):
             await db.execute(delete(model).where(model.user_id == user.id))
@@ -65,16 +84,33 @@ async def recover(email: str, password: str) -> None:
 def read_password(path: Path | None) -> str:
     if path is not None:
         try:
-            password = path.read_text(encoding="utf-8").rstrip("\r\n")
-        except OSError as exc:
+            # Bound the input before Argon2 sees it. Two extra characters allow
+            # a platform line ending after a maximum-length password.
+            with path.open("r", encoding="utf-8") as source:
+                raw = source.read(1027)
+            if len(raw) > 1026:
+                raise SystemExit("The new password may contain at most 1024 characters")
+            password = raw.rstrip("\r\n")
+        except (OSError, UnicodeError) as exc:
             raise SystemExit("Cannot read password file") from exc
     else:
-        password = getpass.getpass("New password: ")
-        confirmation = getpass.getpass("Confirm new password: ")
+        try:
+            # getpass otherwise falls back to an echoed stdin read when no TTY
+            # exists, which can publish an administrator password in logs.
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", getpass.GetPassWarning)
+                password = getpass.getpass("New password: ")
+                confirmation = getpass.getpass("Confirm new password: ")
+        except (getpass.GetPassWarning, EOFError) as exc:
+            raise SystemExit("No private terminal is available; use --password-file with restricted permissions") from exc
         if password != confirmation:
             raise SystemExit("Passwords do not match")
     if len(password) < 12:
         raise SystemExit("The new password must contain at least 12 characters")
+    if len(password) > 1024:
+        raise SystemExit("The new password may contain at most 1024 characters")
+    if "\r" in password or "\n" in password:
+        raise SystemExit("The new password cannot contain a line break")
     return password
 
 
@@ -87,7 +123,7 @@ def main() -> None:
         help="Read the new password from a restricted file; otherwise prompt without terminal echo",
     )
     args = parser.parse_args()
-    asyncio.run(recover(args.email, read_password(args.password_file)))
+    asyncio.run(recover(args.email.strip(), read_password(args.password_file)))
 
 
 if __name__ == "__main__":

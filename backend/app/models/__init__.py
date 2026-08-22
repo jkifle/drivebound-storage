@@ -1,4 +1,5 @@
 from app.models.asset import Asset
+from app.models.account_deletion import AccountDeletionJob
 from app.models.album import Album, AlbumAsset, AlbumInvite, AlbumMember
 from app.models.auth import (
     AccountToken, AuditEvent, AuthSession, ExternalIdentity, MfaRecoveryCode,
@@ -17,5 +18,5 @@ from app.models.upload_session import UploadSession
 from app.models.user import User
 
 __all__ = [
-    "AccountToken", "Album", "AlbumAsset", "AlbumInvite", "AlbumMember", "Asset", "AssetReplica", "AuditEvent", "AuthSession", "BackupArchive", "Device", "ExternalIdentity", "ExternalLibrary", "MediaGroup", "MediaGroupMember", "MfaRecoveryCode", "MonitoringEvent", "NodePairingCode", "PairedNode", "PasskeyCredential", "ShareLink", "StorageDrive", "StoragePolicy", "SyncConflict", "SyncItem", "SyncOperation", "SyncRoot", "UploadSession", "User", "WebAuthnChallenge"
+    "AccountDeletionJob", "AccountToken", "Album", "AlbumAsset", "AlbumInvite", "AlbumMember", "Asset", "AssetReplica", "AuditEvent", "AuthSession", "BackupArchive", "Device", "ExternalIdentity", "ExternalLibrary", "MediaGroup", "MediaGroupMember", "MfaRecoveryCode", "MonitoringEvent", "NodePairingCode", "PairedNode", "PasskeyCredential", "ShareLink", "StorageDrive", "StoragePolicy", "SyncConflict", "SyncItem", "SyncOperation", "SyncRoot", "UploadSession", "User", "WebAuthnChallenge"
 ]

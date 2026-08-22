@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.security import current_auth, oauth2_scheme, token_digest
+from app.core.security import current_auth, oauth2_scheme, reject_suppressed_account, token_digest
 from app.db.session import get_db
 from app.models.asset import Asset
 from app.models.device import Device
@@ -19,7 +19,7 @@ from app.models.user import User
 from app.schemas.asset import AssetResponse
 from app.schemas.upload import UploadSessionCreate, UploadSessionResponse
 from app.services.ingestion import persist_managed_asset
-from app.services.storage import sha256_file
+from app.services.storage import canonical_storage_path, sha256_file
 from app.worker.tasks import process_asset_task
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
@@ -41,6 +41,10 @@ async def upload_principal(
     if x_device_token:
         device = await session.scalar(select(Device).where(Device.token_hash == token_digest(x_device_token)))
         if device is None:
+            raise HTTPException(status_code=401, detail="Invalid device token")
+        reject_suppressed_account(device.user_id)
+        user = await session.scalar(select(User).where(User.id == device.user_id, User.disabled_at.is_(None)))
+        if user is None:
             raise HTTPException(status_code=401, detail="Invalid device token")
         device.last_seen_at = datetime.now(timezone.utc)
         await session.flush()
@@ -70,6 +74,13 @@ async def create_upload(
 ) -> UploadSessionResponse:
     if payload.total_size > settings.max_upload_size:
         raise HTTPException(status_code=413, detail="Upload exceeds the configured size limit")
+    owner = await session.scalar(
+        select(User)
+        .where(User.id == principal.user_id, User.disabled_at.is_(None))
+        .with_for_update(read=True)
+    )
+    if owner is None:
+        raise HTTPException(status_code=401, detail="Account is unavailable")
     if payload.checksum:
         existing = await session.scalar(
             select(Asset).where(
@@ -94,9 +105,10 @@ async def create_upload(
             )
             return session_response(placeholder, existing, duplicate=True)
 
-    settings.staging_path.mkdir(parents=True, exist_ok=True)
+    staging_directory = settings.staging_path / str(principal.user_id)
+    staging_directory.mkdir(parents=True, exist_ok=True)
     upload_id = uuid.uuid4()
-    staging_path = settings.staging_path / f"{upload_id}.resumable"
+    staging_path = (staging_directory / f"{upload_id}.resumable").resolve()
     async with aiofiles.open(staging_path, "xb"):
         pass
     upload = UploadSession(
@@ -109,11 +121,16 @@ async def create_upload(
         expected_checksum=payload.checksum,
         file_created_at=payload.file_created_at,
         file_modified_at=payload.file_modified_at,
-        staging_path=str(staging_path),
+        staging_path=canonical_storage_path(staging_path),
         expires_at=datetime.now(timezone.utc) + timedelta(hours=settings.upload_session_hours),
     )
     session.add(upload)
-    await session.commit()
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        staging_path.unlink(missing_ok=True)
+        raise
     await session.refresh(upload)
     return session_response(upload)
 
@@ -143,6 +160,13 @@ async def append_upload(
     session: AsyncSession = Depends(get_db),
     principal: UploadPrincipal = Depends(upload_principal),
 ) -> UploadSessionResponse:
+    owner = await session.scalar(
+        select(User)
+        .where(User.id == principal.user_id, User.disabled_at.is_(None))
+        .with_for_update(read=True)
+    )
+    if owner is None:
+        raise HTTPException(status_code=401, detail="Account is unavailable")
     upload = await session.scalar(
         select(UploadSession)
         .where(UploadSession.id == upload_id, UploadSession.user_id == principal.user_id)

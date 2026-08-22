@@ -11,8 +11,126 @@ from app.core.config import settings
 from app.models.asset import Asset
 from app.models.auth import AuditEvent
 from app.models.replica import AssetReplica
+from app.models.upload_session import UploadSession
 from app.models.storage_policy import StoragePolicy
-from app.services.storage import validated_replica_drive_path, validated_storage_path
+from app.models.user import User
+from app.services.storage import (
+    canonical_storage_path,
+    lock_storage_path,
+    validated_replica_drive_path,
+    validated_storage_path,
+)
+
+
+async def physical_path_has_other_reference(
+    session: AsyncSession,
+    path: str,
+    *,
+    excluding_asset_id: uuid.UUID | None = None,
+    excluding_replica_id: uuid.UUID | None = None,
+    excluding_upload_id: uuid.UUID | None = None,
+) -> bool:
+    """Check every catalog path kind before unlinking one physical object.
+
+    Roots are administrator-configurable and may overlap.  A replica path can
+    therefore also be another account's external original; checking only the
+    source column is unsafe.  External originals are always protected, even
+    when their own catalog row is the asset currently being purged.
+    """
+    external_original = await session.scalar(
+        select(Asset.id).where(Asset.storage_source == "external", Asset.original_path == path).limit(1)
+    )
+    if external_original is not None:
+        return True
+    asset_reference = select(Asset.id).where(
+        or_(Asset.original_path == path, Asset.thumbnail_path == path, Asset.preview_path == path)
+    )
+    if excluding_asset_id is not None:
+        asset_reference = asset_reference.where(Asset.id != excluding_asset_id)
+    if await session.scalar(asset_reference.limit(1)) is not None:
+        return True
+    replica_reference = select(AssetReplica.id).where(
+        or_(AssetReplica.path == path, AssetReplica.metadata_path == path)
+    )
+    if excluding_replica_id is not None:
+        replica_reference = replica_reference.where(AssetReplica.id != excluding_replica_id)
+    if await session.scalar(replica_reference.limit(1)) is not None:
+        return True
+    upload_reference = select(UploadSession.id).where(UploadSession.staging_path == path)
+    if excluding_upload_id is not None:
+        upload_reference = upload_reference.where(UploadSession.id != excluding_upload_id)
+    if await session.scalar(upload_reference.limit(1)) is not None:
+        return True
+
+    # Legacy rows may predate the canonical-path invariant. Exact SQL equality
+    # above is the fast path; this bounded deletion-time fallback compares the
+    # canonical physical identity across every possible path column so a
+    # canonical deleting row cannot unlink another account's ``..``/symlink/
+    # Windows-case alias. New publishers share the advisory lock above.
+    target_identity = canonical_storage_path(path)
+
+    async def aliases(column, *, excluded_id=None, id_column=None) -> bool:
+        statement = select(column).where(column.is_not(None))
+        if excluded_id is not None and id_column is not None:
+            statement = statement.where(id_column != excluded_id)
+        values = (await session.scalars(statement)).all()
+        return any(
+            not str(value).startswith("duplicate:") and canonical_storage_path(value) == target_identity
+            for value in values
+        )
+
+    # External originals remain protected even when the derivative being
+    # removed belongs to the same Asset row.
+    external_aliases = (await session.scalars(
+        select(Asset.original_path).where(Asset.storage_source == "external")
+    )).all()
+    if any(canonical_storage_path(value) == target_identity for value in external_aliases):
+        return True
+    for column in (Asset.original_path, Asset.thumbnail_path, Asset.preview_path):
+        if await aliases(column, excluded_id=excluding_asset_id, id_column=Asset.id):
+            return True
+    for column in (AssetReplica.path, AssetReplica.metadata_path):
+        if await aliases(column, excluded_id=excluding_replica_id, id_column=AssetReplica.id):
+            return True
+    return await aliases(
+        UploadSession.staging_path,
+        excluded_id=excluding_upload_id,
+        id_column=UploadSession.id,
+    )
+
+
+async def safely_unlink_catalog_path(
+    session: AsyncSession,
+    path: str,
+    *,
+    root: Path | None = None,
+    replica_root: bool = False,
+    excluding_asset_id: uuid.UUID | None = None,
+    excluding_replica_id: uuid.UUID | None = None,
+    excluding_upload_id: uuid.UUID | None = None,
+) -> bool:
+    """Reference-aware, path-validated unlink under the shared path lock."""
+    resolved = (
+        validated_replica_drive_path(path)
+        if replica_root
+        else validated_storage_path(path, root if root is not None else settings.staging_path)
+    )
+    # Exact canonical storage is an invariant for new writers.  Never auto-
+    # unlink a legacy alias: the exact-string catalog query below could miss a
+    # second row naming the same inode through a symlink, ``..``, or case alias.
+    if canonical_storage_path(resolved) != path:
+        raise ValueError("noncanonical_catalog_path")
+    await lock_storage_path(session, resolved)
+    if await physical_path_has_other_reference(
+        session,
+        path,
+        excluding_asset_id=excluding_asset_id,
+        excluding_replica_id=excluding_replica_id,
+        excluding_upload_id=excluding_upload_id,
+    ):
+        return False
+    resolved.unlink(missing_ok=True)
+    return True
 
 
 async def storage_policy(session: AsyncSession, user_id: uuid.UUID) -> StoragePolicy:
@@ -64,12 +182,23 @@ async def trash_asset(
 
 
 async def restore_asset_from_trash(session: AsyncSession, asset: Asset, *, actor: str) -> Asset:
+    active_user = await session.scalar(
+        select(User)
+        .where(User.id == asset.user_id, User.disabled_at.is_(None))
+        .with_for_update(read=True)
+    )
+    if active_user is None:
+        raise ValueError("Account is unavailable")
     revisions = list((await session.scalars(
         select(Asset)
         .where(Asset.user_id == asset.user_id, Asset.logical_id == asset.logical_id)
+        .order_by(Asset.id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )).all())
-    asset = next((revision for revision in revisions if revision.id == asset.id), asset)
+    asset = next((revision for revision in revisions if revision.id == asset.id), None)
+    if asset is None:
+        raise ValueError("This asset no longer exists")
     if asset.lifecycle_state != "trashed":
         raise ValueError("This revision is not in trash")
     active = next(
@@ -89,14 +218,26 @@ async def restore_asset_from_trash(session: AsyncSession, asset: Asset, *, actor
 
 
 async def rollback_asset(session: AsyncSession, current: Asset, target: Asset, *, actor: str) -> Asset:
-    if current.user_id != target.user_id or current.logical_id != target.logical_id:
-        raise ValueError("That revision is not part of this file history")
+    active_user = await session.scalar(
+        select(User)
+        .where(User.id == target.user_id, User.disabled_at.is_(None))
+        .with_for_update(read=True)
+    )
+    if active_user is None:
+        raise ValueError("Account is unavailable")
     revisions = list((await session.scalars(
         select(Asset)
         .where(Asset.user_id == target.user_id, Asset.logical_id == target.logical_id)
+        .order_by(Asset.id)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )).all())
-    target = next((revision for revision in revisions if revision.id == target.id), target)
+    current = next((revision for revision in revisions if revision.id == current.id), None)
+    target = next((revision for revision in revisions if revision.id == target.id), None)
+    if current is None or target is None or current.user_id != target.user_id or current.logical_id != target.logical_id:
+        raise ValueError("That revision is not part of this file history")
+    if current.lifecycle_state != "active":
+        raise ValueError("The current revision cannot be changed while permanent deletion is in progress")
     if target.lifecycle_state not in {"active", "superseded"}:
         if target.lifecycle_state == "trashed":
             raise ValueError("Restore a trashed revision before rolling back")
@@ -127,7 +268,12 @@ async def rollback_asset(session: AsyncSession, current: Asset, target: Asset, *
     return target
 
 
-async def safely_purge_asset(session: AsyncSession, asset: Asset) -> bool:
+async def safely_purge_asset(
+    session: AsyncSession,
+    asset: Asset,
+    *,
+    retained_noncanonical: list[str] | None = None,
+) -> bool:
     """Delete only Drivebound-owned bytes after the retention window expires.
 
     Asset revisions can reference the same checksum-addressed file. A byte path
@@ -144,58 +290,81 @@ async def safely_purge_asset(session: AsyncSession, asset: Asset) -> bool:
 
     replicas = list((await session.scalars(select(AssetReplica).where(AssetReplica.asset_id == asset.id))).all())
     for replica in replicas:
-        other_reference = await session.scalar(
-            select(AssetReplica.id).where(AssetReplica.path == replica.path, AssetReplica.id != replica.id).limit(1)
-        )
-        if other_reference is None:
-            try:
-                replica_path = validated_replica_drive_path(replica.path)
-                replica_path.unlink(missing_ok=True)
-            except Exception as exc:
+        try:
+            await safely_unlink_catalog_path(
+                session, replica.path, replica_root=True, excluding_replica_id=replica.id
+            )
+        except Exception as exc:
+            if retained_noncanonical is not None and str(exc) == "noncanonical_catalog_path":
+                retained_noncanonical.append("replica")
+                audit(session, asset.user_id, "asset.path_retained", {
+                    "asset_id": str(asset.id), "path_kind": "replica", "reason": "noncanonical_legacy_alias",
+                })
+                return False
+            else:
                 # Keep the database reference so a later purge pass can retry.
-                audit(session, asset.user_id, "asset.purge_deferred", {"asset_id": str(asset.id), "reason": str(exc)[:500]})
+                audit(session, asset.user_id, "asset.purge_deferred", {
+                    "asset_id": str(asset.id), "reason": type(exc).__name__, "path_kind": "replica",
+                })
                 return False
         if replica.metadata_path:
-            other_metadata = await session.scalar(
-                select(AssetReplica.id)
-                .where(AssetReplica.metadata_path == replica.metadata_path, AssetReplica.id != replica.id)
-                .limit(1)
-            )
-            if other_metadata is None:
-                try:
-                    validated_replica_drive_path(replica.metadata_path).unlink(missing_ok=True)
-                except Exception as exc:
+            try:
+                await safely_unlink_catalog_path(
+                    session, replica.metadata_path, replica_root=True, excluding_replica_id=replica.id
+                )
+            except Exception as exc:
+                if retained_noncanonical is not None and str(exc) == "noncanonical_catalog_path":
+                    retained_noncanonical.append("replica_metadata")
+                    audit(session, asset.user_id, "asset.path_retained", {
+                        "asset_id": str(asset.id), "path_kind": "replica_metadata",
+                        "reason": "noncanonical_legacy_alias",
+                    })
+                    return False
+                else:
                     audit(session, asset.user_id, "asset.purge_deferred", {
-                        "asset_id": str(asset.id), "reason": str(exc)[:500], "path_kind": "replica_metadata",
+                        "asset_id": str(asset.id), "reason": type(exc).__name__, "path_kind": "replica_metadata",
                     })
                     return False
         await session.delete(replica)
 
     if asset.storage_source == "managed":
-        other_asset = await session.scalar(select(Asset.id).where(Asset.original_path == asset.original_path, Asset.id != asset.id).limit(1))
-        if other_asset is None:
-            try:
-                validated_storage_path(asset.original_path, settings.originals_path).unlink(missing_ok=True)
-            except Exception as exc:
-                audit(session, asset.user_id, "asset.purge_deferred", {"asset_id": str(asset.id), "reason": str(exc)[:500]})
+        try:
+            await safely_unlink_catalog_path(
+                session, asset.original_path, root=settings.originals_path, excluding_asset_id=asset.id
+            )
+        except Exception as exc:
+            if retained_noncanonical is not None and str(exc) == "noncanonical_catalog_path":
+                retained_noncanonical.append("managed_original")
+                audit(session, asset.user_id, "asset.path_retained", {
+                    "asset_id": str(asset.id), "path_kind": "managed_original",
+                    "reason": "noncanonical_legacy_alias",
+                })
+                return False
+            else:
+                audit(session, asset.user_id, "asset.purge_deferred", {
+                    "asset_id": str(asset.id), "reason": type(exc).__name__, "path_kind": "managed_original",
+                })
                 return False
     # Thumbnails and previews are always Drivebound-owned, including those
     # generated for read-only external libraries. Do not leak them when the
     # catalog entry is permanently deleted.
     for derivative in {asset.thumbnail_path, asset.preview_path} - {None}:
-        other_derivative = await session.scalar(
-            select(Asset.id).where(
-                (Asset.thumbnail_path == derivative) | (Asset.preview_path == derivative), Asset.id != asset.id
-            ).limit(1)
-        )
-        if other_derivative is None:
-            try:
-                validated_storage_path(derivative, settings.derivatives_path).unlink(missing_ok=True)
-            except Exception as exc:
+        try:
+            await safely_unlink_catalog_path(
+                session, derivative, root=settings.derivatives_path, excluding_asset_id=asset.id
+            )
+        except Exception as exc:
+            if retained_noncanonical is not None and str(exc) == "noncanonical_catalog_path":
+                retained_noncanonical.append("derivative")
+                audit(session, asset.user_id, "asset.path_retained", {
+                    "asset_id": str(asset.id), "path_kind": "derivative", "reason": "noncanonical_legacy_alias",
+                })
+                return False
+            else:
                 # Keep the tombstone and retry. Losing this database path would
                 # otherwise turn the derivative into an uncollectable orphan.
                 audit(session, asset.user_id, "asset.purge_deferred", {
-                    "asset_id": str(asset.id), "reason": str(exc)[:500], "path_kind": "derivative",
+                    "asset_id": str(asset.id), "reason": type(exc).__name__, "path_kind": "derivative",
                 })
                 return False
 

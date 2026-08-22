@@ -11,6 +11,7 @@ from app.core.security import (
     current_user_or_device,
     hash_password_async,
     opaque_token,
+    reject_suppressed_account,
     token_digest,
     verify_password_async,
 )
@@ -29,6 +30,7 @@ async def resolve_share(session: AsyncSession, token: str, password: str | None)
     share = await session.scalar(select(ShareLink).where(ShareLink.token_hash == token_digest(token)))
     if share is None:
         raise HTTPException(status_code=404, detail="Share not found")
+    reject_suppressed_account(share.user_id)
     now = datetime.now(timezone.utc)
     expires_at = share.expires_at
     if expires_at and (expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)) <= now:

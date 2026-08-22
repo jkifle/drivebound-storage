@@ -35,7 +35,6 @@ class PairedNode(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     public_key: Mapped[str] = mapped_column(Text, nullable=False)
     endpoint_url: Mapped[str | None] = mapped_column(Text)
-    node_secret: Mapped[str | None] = mapped_column(Text, unique=True)
     secret_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="offline", server_default="offline")
     version: Mapped[str | None] = mapped_column(String(64))

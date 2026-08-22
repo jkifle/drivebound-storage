@@ -9,9 +9,34 @@ from typing import Iterator
 
 import aiofiles
 from fastapi import HTTPException, UploadFile, status
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.services.encryption import decrypt_file, encrypt_file
+
+
+def storage_path_lock_key(path: Path | str) -> int:
+    """Stable PostgreSQL advisory-lock key for physical path publication.
+
+    Every writer/reference publisher and collector uses this key so a path
+    cannot become referenced between the collector's final reference check and
+    unlink.  The signed 64-bit prefix is accepted by pg_advisory_xact_lock.
+    """
+    normalized = os.path.normcase(str(Path(path).resolve())).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(normalized).digest()[:8], "big", signed=True)
+
+
+def canonical_storage_path(path: Path | str) -> str:
+    """Canonical catalog representation (case-folded on Windows)."""
+    return os.path.normcase(str(Path(path).resolve()))
+
+
+async def lock_storage_path(session: AsyncSession, path: Path | str) -> None:
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:key)"),
+        {"key": storage_path_lock_key(path)},
+    )
 
 def original_path_for(checksum: str, filename: str | None, user_id: uuid.UUID | None = None) -> Path:
     # Content identity, not a client-controlled filename, determines the path.
@@ -28,9 +53,10 @@ def derivative_path_for(kind: str, checksum: str, user_id: uuid.UUID) -> Path:
     return settings.derivatives_path / kind / str(user_id) / checksum[:2] / f"{checksum}.webp"
 
 
-async def stage_upload(upload: UploadFile) -> tuple[Path, str, int]:
-    settings.staging_path.mkdir(parents=True, exist_ok=True)
-    temporary_path = settings.staging_path / f"{uuid.uuid4()}.upload"
+async def stage_upload(upload: UploadFile, user_id: uuid.UUID | None = None) -> tuple[Path, str, int]:
+    staging_directory = settings.staging_path / str(user_id) if user_id is not None else settings.staging_path
+    staging_directory.mkdir(parents=True, exist_ok=True)
+    temporary_path = staging_directory / f"{uuid.uuid4()}.upload"
     digest = hashlib.sha256()
     size = 0
 
@@ -101,10 +127,16 @@ def commit_encrypted_derivative(staged_path: Path, final_path: Path, key: bytes)
 
 
 @contextmanager
-def decrypted_temporary_file(source: Path, key: bytes, suffix: str = "") -> Iterator[Path]:
+def decrypted_temporary_file(
+    source: Path,
+    key: bytes,
+    suffix: str = "",
+    user_id: uuid.UUID | None = None,
+) -> Iterator[Path]:
     """Expose authenticated plaintext only for the duration of a worker task."""
-    settings.staging_path.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_path = tempfile.mkstemp(prefix="decrypt-", suffix=suffix, dir=settings.staging_path)
+    staging_directory = settings.staging_path / str(user_id) if user_id is not None else settings.staging_path
+    staging_directory.mkdir(parents=True, exist_ok=True)
+    descriptor, raw_path = tempfile.mkstemp(prefix="decrypt-", suffix=suffix, dir=staging_directory)
     os.close(descriptor)
     destination = Path(raw_path)
     destination.unlink(missing_ok=True)

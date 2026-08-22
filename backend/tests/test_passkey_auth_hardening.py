@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import Request, Response
 from fastapi.testclient import TestClient
+from sqlalchemy.dialects import postgresql
 from webauthn.helpers import parse_authentication_credential_json
 from webauthn.helpers.exceptions import WebAuthnException
 
@@ -652,3 +653,61 @@ def test_kdf_capacity_is_held_through_repeated_cancellation() -> None:
 
     asyncio.run(scenario())
     assert maximum <= 4
+
+
+class CurrentAuthSession:
+    def __init__(self, auth_session, user):
+        self.auth_session = auth_session
+        self.user = user
+
+    async def scalar(self, _statement):
+        return self.auth_session
+
+    async def get(self, _model, _identifier):
+        return self.user
+
+
+class ActivitySession:
+    def __init__(self):
+        self.statement = None
+        self.committed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def execute(self, statement):
+        self.statement = statement
+
+    async def commit(self):
+        self.committed = True
+
+
+def test_last_seen_touch_rechecks_session_and_active_account(monkeypatch) -> None:
+    now = datetime.now(timezone.utc)
+    user = User(id=uuid.uuid4(), email="person@example.com", password_hash="unused")
+    auth_session = AuthSession(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        refresh_token_hash="f" * 64,
+        last_seen_at=now - timedelta(hours=1),
+        expires_at=now + timedelta(hours=1),
+    )
+    activity = ActivitySession()
+    monkeypatch.setattr(security, "async_session_factory", lambda: activity)
+    token = security.create_access_token(user.id, auth_session.id)
+    request = Request({"type": "http", "method": "GET", "path": "/", "headers": []})
+
+    assert run(security.current_auth(request, token, CurrentAuthSession(auth_session, user))) == (
+        user,
+        auth_session,
+    )
+    assert activity.committed is True
+    compiled = str(activity.statement.compile(dialect=postgresql.dialect())).lower()
+    assert "auth_sessions.revoked_at is null" in compiled
+    assert "auth_sessions.expires_at >" in compiled
+    assert "auth_sessions.last_seen_at <" in compiled
+    assert "exists (select *" in compiled
+    assert "users.disabled_at is null" in compiled

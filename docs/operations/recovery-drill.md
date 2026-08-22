@@ -10,6 +10,8 @@ a successful restore drill.
 
 - A recently verified `database` archive from `BACKUPS_PATH`.
 - A recent `configuration` archive from the same directory.
+- The independently retained `account-deletion-suppressions` ledger that was
+  current when the recovery inputs were captured.
 - Separately protected deployment secrets, especially the PostgreSQL password,
   `JWT_SECRET`, `MFA_ENCRYPTION_SECRET`, and
   `MEDIA_ENCRYPTION_MASTER_KEY`.
@@ -17,7 +19,10 @@ a successful restore drill.
 - The exact Drivebound release or immutable image digest being restored.
 
 Configuration archives deliberately contain no secrets. A database archive and
-replica bytes are not sufficient without the media-encryption master key.
+replica bytes are not sufficient without the media-encryption master key. A
+historical database must never be exposed to traffic without the matching
+suppression ledger: it is what lets startup reapply deletion intent that is
+newer than the restored dump.
 
 ## Automated structural evidence (not a restore drill)
 
@@ -111,15 +116,20 @@ application behavior, not merely archive readability.
 3. Create a new database with a drill-specific name such as
    `drivebound_restore_drill_20260815`. Confirm that the resolved server and
    database name are the isolated targets before running `pg_restore`.
-4. Apply the archive to that empty database, configure a staging backend with
-   the separately restored secrets and read-only/synthetic media mounts, then
-   start exactly one API process. Do not start workers until login and schema
-   inspection succeed.
-5. Confirm Alembic is at the expected revision, then verify account login,
+4. Apply the archive to that empty database. Restore the matching suppression
+   ledger and media-encryption master key before starting any API process. Keep
+   the environment isolated from public ingress, then start exactly one API;
+   startup must reconcile the ledger before it can accept traffic. Do not start
+   workers until schema and suppression-job inspection succeed.
+5. Confirm Alembic is at the expected revision and verify every suppression
+   marker that matches a restored account recreated or preserved a deletion
+   job and left that account disabled. Then verify account login,
    library ownership boundaries, timeline counts, album membership, Trash and
    version history, replica records, and preview decryption.
-6. Start one worker and run the non-destructive account verification endpoint.
-   Exercise repair only against disposable copies created for the drill.
+6. Start one worker and the deletion dispatcher. Allow replayed deletion jobs
+   to reach a terminal state against disposable media, then run the
+   non-destructive account verification endpoint. Exercise repair only against
+   disposable copies created for the drill.
 7. Record elapsed restore time, archive age, missing prerequisites, checksum
    results, and the release/image identifiers used.
 8. Destroy the isolated drill database and decrypted temporary data according
@@ -135,6 +145,9 @@ application behavior, not merely archive readability.
   not make encrypted originals recoverable.
 - If a backup is stale or failed, preserve it for investigation and create a
   new verified archive before pruning anything.
+- If the suppression ledger is absent, invalid, or cannot be paired with the
+  recovery set and media key, keep ingress closed. Recover the ledger from its
+  independent copy; do not infer deletion state from the older database alone.
 - Treat a downgrade that would reinstate older uniqueness constraints as a data
   migration, not as an automatic rollback.
 

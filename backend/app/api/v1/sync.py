@@ -78,7 +78,10 @@ async def push_operations(
     session: AsyncSession = Depends(get_db), user: User = Depends(current_user),
 ) -> SyncPushResponse:
     root = await owned_root(session, user, root_id)
-    operations, conflicts = await apply_operations(session, root, payload.client_id, payload.operations)
+    try:
+        operations, conflicts = await apply_operations(session, root, payload.client_id, payload.operations)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     await session.commit()
     return SyncPushResponse(cursor=root.cursor, operations=[operation_response(operation) for operation in operations], conflicts=[conflict.id for conflict in conflicts])
 

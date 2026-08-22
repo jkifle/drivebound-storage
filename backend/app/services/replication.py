@@ -18,7 +18,15 @@ from app.models.monitoring import MonitoringEvent
 from app.models.replica import AssetReplica
 from app.models.storage_policy import StorageDrive
 from app.services.lifecycle import storage_policy
-from app.services.storage import sha256_file, validated_external_path, validated_replica_drive_path, validated_storage_path
+from app.services.lifecycle import safely_unlink_catalog_path
+from app.services.storage import (
+    canonical_storage_path,
+    lock_storage_path,
+    sha256_file,
+    validated_external_path,
+    validated_replica_drive_path,
+    validated_storage_path,
+)
 
 
 @dataclass(frozen=True)
@@ -125,8 +133,11 @@ def _copy_verified(source: Path, destination: Path, expected_checksum: str) -> t
 
 
 async def _upsert_replica(session: AsyncSession, asset: Asset, target: ReplicaTarget, source: Path) -> AssetReplica:
-    destination = replica_path_for(target, asset)
+    destination = replica_path_for(target, asset).resolve()
+    await lock_storage_path(session, destination)
     checksum, destination = await asyncio.to_thread(_copy_verified, source, destination, asset.storage_checksum)
+    metadata_candidate = destination.with_name(f"{destination.name}.{asset.id}.metadata.json").resolve()
+    await lock_storage_path(session, metadata_candidate)
     metadata_path = await asyncio.to_thread(_write_replica_metadata, asset, destination)
     statement = select(AssetReplica).where(AssetReplica.asset_id == asset.id)
     statement = statement.where(AssetReplica.drive_id.is_(None) if target.id is None else AssetReplica.drive_id == target.id)
@@ -135,18 +146,18 @@ async def _upsert_replica(session: AsyncSession, asset: Asset, target: ReplicaTa
         replica = AssetReplica(
             asset_id=asset.id,
             drive_id=target.id,
-            path=str(destination),
+            path=canonical_storage_path(destination),
             checksum=checksum,
-            metadata_path=str(metadata_path),
+            metadata_path=canonical_storage_path(metadata_path),
             status="verified",
             verification_status="verified",
             verified_at=datetime.now(timezone.utc),
         )
         session.add(replica)
     else:
-        replica.path = str(destination)
+        replica.path = canonical_storage_path(destination)
         replica.checksum = checksum
-        replica.metadata_path = str(metadata_path)
+        replica.metadata_path = canonical_storage_path(metadata_path)
         replica.status = "verified"
         replica.verification_status = "verified"
         replica.failure_count = 0
@@ -226,7 +237,12 @@ async def rebalance_replicas(session: AsyncSession, user_id: uuid.UUID, limit: i
     replicas = list((await session.execute(
         select(AssetReplica, Asset)
         .join(Asset, Asset.id == AssetReplica.asset_id)
-        .where(Asset.user_id == user_id, AssetReplica.status == "verified", AssetReplica.drive_id == high.id)
+        .where(
+            Asset.user_id == user_id,
+            Asset.lifecycle_state == "active",
+            AssetReplica.status == "verified",
+            AssetReplica.drive_id == high.id,
+        )
         .limit(limit)
     )).all())
     moved = 0
@@ -243,11 +259,21 @@ async def rebalance_replicas(session: AsyncSession, user_id: uuid.UUID, limit: i
             new_replica = await _upsert_replica(session, asset, low, source)
             if new_replica.checksum != asset.storage_checksum:
                 continue
-            old_path, old_metadata = Path(replica.path), Path(replica.metadata_path) if replica.metadata_path else None
-            await session.delete(replica)
-            old_path.unlink(missing_ok=True)
+            old_metadata = Path(replica.metadata_path) if replica.metadata_path else None
+            await safely_unlink_catalog_path(
+                session,
+                replica.path,
+                replica_root=True,
+                excluding_replica_id=replica.id,
+            )
             if old_metadata:
-                old_metadata.unlink(missing_ok=True)
+                await safely_unlink_catalog_path(
+                    session,
+                    replica.metadata_path or str(old_metadata),
+                    replica_root=True,
+                    excluding_replica_id=replica.id,
+                )
+            await session.delete(replica)
             moved += 1
         except Exception as exc:
             session.add(MonitoringEvent(

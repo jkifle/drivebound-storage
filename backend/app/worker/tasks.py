@@ -27,14 +27,16 @@ from app.models.replica import AssetReplica
 from app.models.monitoring import MonitoringEvent
 from app.models.storage_policy import StorageDrive
 from app.models.user import User
-from app.services.ingestion import user_media_key
+from app.services.ingestion import encrypted_plaintext_checksum, initialize_user_media_key, user_media_key
 from app.services.encryption import encrypt_file
 from app.services.intelligence import embed_text, extract_ocr
 from app.services.notifications import notify_user_devices
 from app.services.storage import (
+    canonical_storage_path,
     commit_encrypted_derivative,
     decrypted_temporary_file,
     derivative_path_for,
+    lock_storage_path,
     original_path_for,
     sha256_file,
     validated_external_path,
@@ -44,7 +46,14 @@ from app.services.storage import (
 from app.services.replication import ensure_asset_replicas
 from app.services.replication import rebalance_replicas
 from app.services.media_groups import group_asset, perceptual_hash
-from app.services.lifecycle import purge_due_assets
+from app.services.lifecycle import purge_due_assets, safely_unlink_catalog_path
+from app.services.account_deletion import (
+    claim_account_deletion_job,
+    due_account_deletion_job_ids,
+    process_account_deletion_batch,
+    reconcile_suppression_ledger,
+    record_account_deletion_publish,
+)
 from app.services.operational_backups import (
     create_configuration_backup,
     create_database_backup,
@@ -60,6 +69,27 @@ def _text(value: object | None) -> str | None:
     if isinstance(value, bytes):
         return value.decode(errors="replace").strip("\x00 ") or None
     return str(value).strip("\x00 ") or None
+
+
+async def active_asset_for_write(
+    session: AsyncSession,
+    asset_id: uuid.UUID,
+) -> tuple[Asset, User] | None:
+    """Fence stale workers with the global User -> Asset lock order."""
+    user_id = await session.scalar(select(Asset.user_id).where(Asset.id == asset_id))
+    if user_id is None:
+        return None
+    user = await session.scalar(
+        select(User).where(User.id == user_id, User.disabled_at.is_(None)).with_for_update(read=True)
+    )
+    if user is None:
+        return None
+    asset = await session.scalar(
+        select(Asset)
+        .where(Asset.id == asset_id, Asset.user_id == user.id, Asset.lifecycle_state == "active")
+        .with_for_update()
+    )
+    return (asset, user) if asset is not None else None
 
 
 def _decimal(values: object, reference: object) -> float | None:
@@ -214,7 +244,7 @@ def plaintext_asset_file(asset: Asset, user: User | None) -> Iterator[Path]:
         if user is None:
             raise ValueError("Encrypted asset is missing its owning account")
         suffix = Path(asset.original_filename or "").suffix
-        with decrypted_temporary_file(source, user_media_key(user), suffix) as plaintext:
+        with decrypted_temporary_file(source, user_media_key(user), suffix, asset.user_id) as plaintext:
             yield plaintext
     else:
         yield source
@@ -225,15 +255,14 @@ async def process_asset(asset_id: uuid.UUID) -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as session:
-            asset = await session.get(Asset, asset_id)
-            if asset is None:
+            writable = await active_asset_for_write(session, asset_id)
+            if writable is None:
                 return
+            asset, user = writable
             asset.processing_status = "processing"
             asset.processing_error = None
-            await session.commit()
 
             try:
-                user = await session.get(User, asset.user_id) if asset.encryption_version else None
                 with plaintext_asset_file(asset, user) as original:
                     if asset.mime_type.startswith("video/"):
                         metadata = await asyncio.to_thread(
@@ -251,19 +280,27 @@ async def process_asset(asset_id: uuid.UUID) -> None:
                         if asset.encryption_version:
                             if user is None:
                                 raise ValueError("Encrypted asset is missing its owning account")
-                            thumbnail = settings.staging_path / f"{asset.id}.{uuid.uuid4().hex}.thumbnail.webp"
+                            thumbnail_directory = settings.staging_path / str(asset.user_id)
+                            thumbnail_directory.mkdir(parents=True, exist_ok=True)
+                            thumbnail = (thumbnail_directory / f"{asset.id}.{uuid.uuid4().hex}.thumbnail.webp").resolve()
                         else:
-                            thumbnail = settings.derivatives_path / "thumbnails" / asset.checksum[:2] / f"{asset.checksum}.webp"
+                            thumbnail = (
+                                settings.derivatives_path / "thumbnails" / asset.checksum[:2] / f"{asset.checksum}.webp"
+                            ).resolve()
+                            await lock_storage_path(session, thumbnail)
                         metadata = await asyncio.to_thread(
                             extract_and_thumbnail,
                             original,
                             thumbnail,
                             asset.file_modified_at or asset.created_at,
                         )
+                        if not asset.encryption_version:
+                            metadata["thumbnail_path"] = canonical_storage_path(thumbnail)
                         if asset.encryption_version:
-                            encrypted_thumbnail = derivative_path_for("thumbnails", asset.checksum, asset.user_id)
+                            encrypted_thumbnail = derivative_path_for("thumbnails", asset.checksum, asset.user_id).resolve()
+                            await lock_storage_path(session, encrypted_thumbnail)
                             commit_encrypted_derivative(thumbnail, encrypted_thumbnail, user_media_key(user))
-                            metadata["thumbnail_path"] = str(encrypted_thumbnail)
+                            metadata["thumbnail_path"] = canonical_storage_path(encrypted_thumbnail)
                         for field, value in metadata.items():
                             setattr(asset, field, value)
                         asset.processing_status = "complete"
@@ -287,8 +324,9 @@ async def process_asset(asset_id: uuid.UUID) -> None:
                         await session.commit()
             except Exception as exc:
                 await session.rollback()
-                asset = await session.get(Asset, asset_id)
-                if asset is not None:
+                writable = await active_asset_for_write(session, asset_id)
+                if writable is not None:
+                    asset, _ = writable
                     asset.processing_status = "failed"
                     asset.processing_error = str(exc)[:2000]
                     await session.commit()
@@ -307,13 +345,12 @@ async def index_asset(asset_id: uuid.UUID) -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as session:
-            asset = await session.get(Asset, asset_id)
-            if asset is None:
+            writable = await active_asset_for_write(session, asset_id)
+            if writable is None:
                 return
+            asset, user = writable
             asset.intelligence_status = "indexing"
-            await session.commit()
             try:
-                user = await session.get(User, asset.user_id) if asset.encryption_version else None
                 with plaintext_asset_file(asset, user) as original:
                     ocr_text = await asyncio.to_thread(extract_ocr, original, asset.mime_type)
                 parts = [
@@ -330,8 +367,9 @@ async def index_asset(asset_id: uuid.UUID) -> None:
                 await session.commit()
             except Exception:
                 await session.rollback()
-                asset = await session.get(Asset, asset_id)
-                if asset is not None:
+                writable = await active_asset_for_write(session, asset_id)
+                if writable is not None:
+                    asset, _ = writable
                     asset.intelligence_status = "failed"
                     await session.commit()
                 raise
@@ -349,9 +387,10 @@ async def build_media_groups(asset_id: uuid.UUID) -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as session:
-            asset = await session.get(Asset, asset_id)
-            if asset is None:
+            writable = await active_asset_for_write(session, asset_id)
+            if writable is None:
                 return
+            asset, _ = writable
             await group_asset(session, asset)
             await session.commit()
     finally:
@@ -377,6 +416,11 @@ async def scan_external_library(library_id: uuid.UUID) -> None:
             library = await session.get(ExternalLibrary, library_id)
             if library is None:
                 return
+            owner = await session.scalar(
+                select(User).where(User.id == library.user_id, User.disabled_at.is_(None)).with_for_update(read=True)
+            )
+            if owner is None:
+                return
             library.status = "scanning"
             library.error = None
             await session.commit()
@@ -388,10 +432,24 @@ async def scan_external_library(library_id: uuid.UUID) -> None:
                 batch: list[tuple[Path, str, int, str, datetime | None, datetime]] = []
                 discovered = 0
 
-                async def save_batch() -> None:
+                async def save_batch() -> bool:
                     nonlocal batch
                     if not batch:
-                        return
+                        return True
+                    owner = await session.scalar(
+                        select(User)
+                        .where(User.id == library.user_id, User.disabled_at.is_(None))
+                        .with_for_update(read=True)
+                    )
+                    current_library = await session.scalar(
+                        select(ExternalLibrary)
+                        .where(ExternalLibrary.id == library_id, ExternalLibrary.user_id == library.user_id)
+                        .with_for_update()
+                    )
+                    if owner is None or current_library is None:
+                        await session.rollback()
+                        batch = []
+                        return False
                     checksums = [item[1] for item in batch]
                     existing = set(
                         (
@@ -407,9 +465,14 @@ async def scan_external_library(library_id: uuid.UUID) -> None:
                     for path, checksum, size, mime_type, file_created_at, file_modified_at in batch:
                         if checksum in existing:
                             continue
+                        canonical_path = path.resolve()
+                        # Publish external path references under the same object
+                        # lock used by collectors. The original itself remains
+                        # read-only and is never removed by account cleanup.
+                        await lock_storage_path(session, canonical_path)
                         asset = Asset(
-                            user_id=library.user_id,
-                            original_path=str(path),
+                            user_id=current_library.user_id,
+                            original_path=canonical_storage_path(canonical_path),
                             checksum=checksum,
                             storage_checksum=checksum,
                             encryption_version=0,
@@ -417,7 +480,7 @@ async def scan_external_library(library_id: uuid.UUID) -> None:
                             mime_type=mime_type,
                             processing_status="pending",
                             storage_source="external",
-                            external_library_id=library.id,
+                            external_library_id=current_library.id,
                             original_filename=path.name,
                             relative_path=str(path.relative_to(root)),
                             file_created_at=file_created_at,
@@ -429,6 +492,7 @@ async def scan_external_library(library_id: uuid.UUID) -> None:
                     for asset in created:
                         process_asset_task.delay(str(asset.id))
                     batch = []
+                    return True
 
                 for path in paths:
                     checksum = await asyncio.to_thread(sha256_file, path)
@@ -442,10 +506,17 @@ async def scan_external_library(library_id: uuid.UUID) -> None:
                     batch.append((path, checksum, stat.st_size, mime_type, file_created_at, file_modified_at))
                     discovered += 1
                     if len(batch) >= 100:
-                        await save_batch()
-                await save_batch()
-                library = await session.get(ExternalLibrary, library_id)
-                if library is not None:
+                        if not await save_batch():
+                            return
+                if not await save_batch():
+                    return
+                owner = await session.scalar(
+                    select(User).where(User.id == library.user_id, User.disabled_at.is_(None)).with_for_update(read=True)
+                )
+                library = await session.scalar(
+                    select(ExternalLibrary).where(ExternalLibrary.id == library_id).with_for_update()
+                )
+                if owner is not None and library is not None:
                     library.status = "idle"
                     library.file_count = discovered
                     library.last_scanned_at = datetime.now(timezone.utc)
@@ -453,7 +524,8 @@ async def scan_external_library(library_id: uuid.UUID) -> None:
             except Exception as exc:
                 await session.rollback()
                 library = await session.get(ExternalLibrary, library_id)
-                if library is not None:
+                owner = await session.get(User, library.user_id) if library is not None else None
+                if library is not None and owner is not None and owner.disabled_at is None:
                     library.status = "failed"
                     library.error = str(exc)[:2000]
                     await session.commit()
@@ -472,11 +544,11 @@ async def protect_asset(asset_id: uuid.UUID) -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as session:
-            asset = await session.get(Asset, asset_id)
-            if asset is None:
+            writable = await active_asset_for_write(session, asset_id)
+            if writable is None:
                 return
+            asset, _ = writable
             asset.protection_status = "protecting"
-            await session.commit()
             # Phase 2 selects the configured number of eligible drives and
             # verifies every copy before exposing the asset as protected.
             try:
@@ -485,8 +557,9 @@ async def protect_asset(asset_id: uuid.UUID) -> None:
                 return
             except Exception:
                 await session.rollback()
-                asset = await session.get(Asset, asset_id)
-                if asset is not None:
+                writable = await active_asset_for_write(session, asset_id)
+                if writable is not None:
+                    asset, _ = writable
                     asset.protection_status = "failed"
                     await session.commit()
                 raise
@@ -717,11 +790,12 @@ async def restore_asset(asset_id: uuid.UUID) -> bool:
     metric_recorded = False
     try:
         async with session_factory() as session:
-            asset = await session.get(Asset, asset_id)
-            if asset is None or asset.lifecycle_state != "active":
+            writable = await active_asset_for_write(session, asset_id)
+            if writable is None:
                 metrics.operations.observe_recovery("asset_restore", "skipped")
                 metric_recorded = True
                 return False
+            asset, _ = writable
             replicas = list((await session.scalars(
                 select(AssetReplica)
                 .outerjoin(StorageDrive, StorageDrive.id == AssetReplica.drive_id)
@@ -737,7 +811,6 @@ async def restore_asset(asset_id: uuid.UUID) -> bool:
                 )
             )).all())
             asset.restore_status = "restoring"
-            await session.commit()
 
             candidates: list[ReplicaCandidate] = []
             failures: list[ReplicaFailure] = []
@@ -752,7 +825,8 @@ async def restore_asset(asset_id: uuid.UUID) -> bool:
                 asset.checksum,
                 asset.original_filename,
                 asset.user_id if asset.encryption_version else None,
-            )
+            ).resolve()
+            await lock_storage_path(session, destination)
             timestamp_value = asset.file_modified_at or asset.file_created_at or asset.taken_at
             try:
                 selected_id, attempted_failures = await asyncio.to_thread(
@@ -775,7 +849,7 @@ async def restore_asset(asset_id: uuid.UUID) -> bool:
                 selected.failure_count = 0
                 selected.last_error = None
                 selected.verified_at = datetime.now(timezone.utc)
-                asset.original_path = str(destination)
+                asset.original_path = canonical_storage_path(destination)
                 asset.storage_source = "managed"
                 asset.external_library_id = None
                 asset.restore_status = "restored"
@@ -1043,6 +1117,11 @@ async def rebalance_user_storage(user_id: uuid.UUID) -> int:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as session:
+            user = await session.scalar(
+                select(User).where(User.id == user_id, User.disabled_at.is_(None)).with_for_update(read=True)
+            )
+            if user is None:
+                return 0
             moved = await rebalance_replicas(session, user_id)
             await session.commit()
             return moved
@@ -1068,6 +1147,66 @@ async def purge_expired_assets(asset_id: uuid.UUID | None = None) -> int:
 @celery_app.task(name="purge_expired_assets")
 def purge_expired_assets_task(asset_id: str | None = None) -> int:
     return asyncio.run(purge_expired_assets(uuid.UUID(asset_id) if asset_id else None))
+
+
+async def cleanup_account_deletion(job_id: uuid.UUID) -> str:
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as session:
+            claimed = await claim_account_deletion_job(session, job_id)
+            if claimed is None:
+                return "skipped"
+            _, lease_token = claimed
+            return await process_account_deletion_batch(session, job_id, lease_token)
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="cleanup_account_deletion")
+def cleanup_account_deletion_task(job_id: str) -> str:
+    # Retries are represented durably in AccountDeletionJob rather than in the
+    # transient broker result backend. The dispatcher recovers failed publish,
+    # worker crashes, and expired leases.
+    outcome = asyncio.run(cleanup_account_deletion(uuid.UUID(job_id)))
+    if outcome == "retry":
+        # Retry timing already lives in PostgreSQL. Raising here makes worker
+        # failure metrics/alerts truthful without asking Celery to duplicate
+        # that retry state in Redis.
+        raise RuntimeError("durable account deletion cleanup deferred")
+    if outcome == "manual_review":
+        # The durable state is terminal until an operator resolves retained
+        # catalog evidence. Surface this delivery as a worker failure so the
+        # existing bounded task alerting cannot mistake it for completion.
+        raise RuntimeError("durable account deletion requires manual review")
+    return outcome
+
+
+async def dispatch_account_deletions() -> int:
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    published = 0
+    try:
+        async with session_factory() as session:
+            await reconcile_suppression_ledger(session)
+            await session.commit()
+            due = await due_account_deletion_job_ids(session)
+            for job_id in due:
+                try:
+                    cleanup_account_deletion_task.delay(str(job_id))
+                except Exception:
+                    await record_account_deletion_publish(session, job_id, published=False)
+                else:
+                    await record_account_deletion_publish(session, job_id, published=True)
+                    published += 1
+        return published
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="dispatch_account_deletions")
+def dispatch_account_deletions_task() -> int:
+    return asyncio.run(dispatch_account_deletions())
 
 
 async def backup_operational_state() -> None:
@@ -1103,27 +1242,86 @@ async def migrate_legacy_media(limit: int = 10) -> int:
         async with session_factory() as session:
             assets = list((await session.scalars(
                 select(Asset)
-                .where(Asset.encryption_version == 0, Asset.storage_source == "managed")
+                .where(
+                    Asset.encryption_version == 0,
+                    Asset.storage_source == "managed",
+                    Asset.lifecycle_state == "active",
+                )
                 .order_by(Asset.created_at)
                 .limit(limit)
             )).all())
-            for asset in assets:
-                source = validated_storage_path(asset.original_path, settings.originals_path)
-                if not source.is_file():
-                    continue
-                user = await session.get(User, asset.user_id)
+            for candidate in assets:
+                user = await session.scalar(
+                    select(User)
+                    .where(User.id == candidate.user_id, User.disabled_at.is_(None))
+                    .with_for_update()
+                )
                 if user is None:
                     continue
-                destination = original_path_for(asset.checksum, asset.original_filename, asset.user_id)
+                asset = await session.scalar(
+                    select(Asset)
+                    .where(
+                        Asset.id == candidate.id,
+                        Asset.user_id == user.id,
+                        Asset.lifecycle_state == "active",
+                        Asset.encryption_version == 0,
+                    )
+                    .with_for_update()
+                )
+                if asset is None:
+                    await session.rollback()
+                    continue
+                if user.media_key_encrypted is None:
+                    # Make the DEK durable before publishing any ciphertext.
+                    # A retry can authenticate an already-linked destination
+                    # only with this committed key.
+                    initialize_user_media_key(user)
+                    await session.commit()
+                    user = await session.scalar(
+                        select(User)
+                        .where(User.id == candidate.user_id, User.disabled_at.is_(None))
+                        .with_for_update()
+                    )
+                    if user is None:
+                        continue
+                    asset = await session.scalar(
+                        select(Asset)
+                        .where(
+                            Asset.id == candidate.id,
+                            Asset.user_id == user.id,
+                            Asset.lifecycle_state == "active",
+                            Asset.encryption_version == 0,
+                        )
+                        .with_for_update()
+                    )
+                    if asset is None:
+                        await session.rollback()
+                        continue
+                source = validated_storage_path(asset.original_path, settings.originals_path)
+                if not source.is_file():
+                    await session.rollback()
+                    continue
+                destination = original_path_for(asset.checksum, asset.original_filename, asset.user_id).resolve()
                 try:
+                    await lock_storage_path(session, destination)
+                    key = user_media_key(user)
                     if not destination.exists():
-                        await asyncio.to_thread(encrypt_file, source, destination, user_media_key(user))
+                        await asyncio.to_thread(encrypt_file, source, destination, key)
+                    elif await asyncio.to_thread(
+                        encrypted_plaintext_checksum, destination, key, asset.file_size
+                    ) != asset.checksum:
+                        raise ValueError("Existing encrypted migration destination does not authenticate")
                     encrypted_thumbnail: Path | None = None
                     old_thumbnail = Path(asset.thumbnail_path) if asset.thumbnail_path else None
                     if old_thumbnail and old_thumbnail.is_file():
-                        encrypted_thumbnail = derivative_path_for("thumbnails", asset.checksum, asset.user_id)
+                        encrypted_thumbnail = derivative_path_for("thumbnails", asset.checksum, asset.user_id).resolve()
+                        await lock_storage_path(session, encrypted_thumbnail)
                         if not encrypted_thumbnail.exists():
-                            await asyncio.to_thread(encrypt_file, old_thumbnail, encrypted_thumbnail, user_media_key(user))
+                            await asyncio.to_thread(encrypt_file, old_thumbnail, encrypted_thumbnail, key)
+                        elif await asyncio.to_thread(
+                            encrypted_plaintext_checksum, encrypted_thumbnail, key
+                        ) != await asyncio.to_thread(sha256_file, old_thumbnail):
+                            raise ValueError("Existing encrypted thumbnail does not authenticate")
                     remaining_originals = await session.scalar(
                         select(Asset.id)
                         .where(
@@ -1142,17 +1340,26 @@ async def migrate_legacy_media(limit: int = 10) -> int:
                         )
                         .limit(1)
                     ) if old_thumbnail else None
-                    asset.original_path = str(destination)
+                    asset.original_path = canonical_storage_path(destination)
                     asset.storage_checksum = await asyncio.to_thread(sha256_file, destination)
                     asset.encryption_version = 1
                     if encrypted_thumbnail:
-                        asset.thumbnail_path = str(encrypted_thumbnail)
+                        asset.thumbnail_path = canonical_storage_path(encrypted_thumbnail)
                     asset.protection_status = "unprotected"
                     await session.commit()
-                    if remaining_originals is None:
-                        source.unlink(missing_ok=True)
-                    if old_thumbnail and remaining_thumbnails is None:
-                        old_thumbnail.unlink(missing_ok=True)
+                    # Reacquire the account fence before collecting legacy
+                    # globals. If deletion won the race, its worker handles
+                    # catalog-backed paths and legacy hygiene stays conservative.
+                    active_user = await session.scalar(
+                        select(User).where(User.id == user.id, User.disabled_at.is_(None)).with_for_update(read=True)
+                    )
+                    if active_user is not None and remaining_originals is None:
+                        await safely_unlink_catalog_path(session, str(source.resolve()), root=settings.originals_path)
+                    if active_user is not None and old_thumbnail and remaining_thumbnails is None:
+                        await safely_unlink_catalog_path(
+                            session, str(old_thumbnail.resolve()), root=settings.derivatives_path
+                        )
+                    await session.commit()
                     try:
                         protect_asset_task.delay(str(asset.id))
                     except Exception:

@@ -5,6 +5,7 @@ import { FormEvent, KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect,
 import { API_URL, apiRequest } from "../api-client";
 import { apiProblemMessage } from "../api-problem";
 import type { DriveboundUser } from "../auth-gate";
+import { DeviceRevocationDialog } from "../device-revocation-dialog";
 import { PasskeyManager } from "../passkey-manager";
 import { ReauthenticationDialog, type ReauthenticationCredentials, type ReauthenticationMethod } from "../reauthentication-dialog";
 import {
@@ -24,6 +25,17 @@ import {
 import { createPasskey, describePasskeyError, getPasskey, passkeysSupported, platformAuthenticatorAvailable } from "../webauthn";
 
 type Session = { id: string; ip_address: string | null; user_agent: string | null; last_seen_at: string; expires_at: string; created_at: string; current: boolean };
+type BackupDevice = {
+  id: string;
+  user_id: string;
+  name: string;
+  platform: string;
+  last_seen_at: string | null;
+  last_backup_at: string | null;
+  files_backed_up: number;
+  bytes_backed_up: number;
+  created_at: string;
+};
 type Audit = { id: string; event_type: string; ip_address: string | null; user_agent: string | null; created_at: string };
 type ApiResult = { message?: string; detail?: string | { code?: string; message?: string }; recovery_codes?: string[] };
 type MessageTone = "status" | "error";
@@ -39,10 +51,29 @@ const googleReauthenticationErrors: Record<string, string> = {
 
 const profileTabs = ["account", "security", "sessions", "activity", "data"] as const;
 type ProfileTab = typeof profileTabs[number];
+const profileTabLabels: Record<ProfileTab, string> = { account: "account", security: "security", sessions: "devices", activity: "activity", data: "data" };
+
+const formatBytes = (value: number) => {
+  if (!Number.isFinite(value) || value <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+  const amount = value / 1024 ** index;
+  return `${amount.toLocaleString(undefined, { maximumFractionDigits: index === 0 ? 0 : 1 })} ${units[index]}`;
+};
+
+const browserSessionName = (session: Session) => {
+  if (session.current) return "This browser";
+  return session.user_agent?.split(" ").slice(0, 3).join(" ") || "Unknown browser";
+};
 
 export function ProfilePage() {
   const [user, setUser] = useState<DriveboundUser | null>(null);
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [devices, setDevices] = useState<BackupDevice[]>([]);
+  const [devicesLoading, setDevicesLoading] = useState(true);
+  const [deviceLoadError, setDeviceLoadError] = useState<string | null>(null);
+  const [deviceToRevoke, setDeviceToRevoke] = useState<BackupDevice | null>(null);
+  const [deviceRevocationError, setDeviceRevocationError] = useState<string | null>(null);
   const [events, setEvents] = useState<Audit[]>([]);
   const [tab, setTab] = useState<ProfileTab>("account");
   const [message, setMessage] = useState<string | null>(null);
@@ -76,23 +107,31 @@ export function ProfilePage() {
 
   const load = useCallback(async () => {
     setLoadError(null);
+    setDeviceLoadError(null);
+    setDevicesLoading(true);
     try {
       const me = await apiRequest("/api/v1/auth/me");
       if (!me.ok) { window.location.assign("/auth"); return; }
       const account: DriveboundUser = await me.json();
       setUser(account);
       setName(account.display_name ?? "");
-      const [sessionList, auditList, passkeyList] = await Promise.all([
+      const [sessionList, deviceList, auditList, passkeyList] = await Promise.all([
         apiRequest("/api/v1/auth/sessions"),
+        apiRequest("/api/v1/devices"),
         apiRequest("/api/v1/auth/audit"),
         listPasskeys().catch(() => null),
       ]);
       if (sessionList.ok) setSessions(await sessionList.json());
+      if (deviceList.ok) setDevices(await deviceList.json());
+      else setDeviceLoadError("Mobile and backup devices could not be loaded.");
       if (auditList.ok) setEvents(await auditList.json());
       if (passkeyList) setPasskeys(passkeyList);
       if (!sessionList.ok || !auditList.ok || !passkeyList) setLoadError("Some account security information could not be refreshed.");
     } catch {
       setLoadError("Drivebound could not load your account. Check the connection and try again.");
+      setDeviceLoadError("Mobile and backup devices could not be loaded. Check the connection and try again.");
+    } finally {
+      setDevicesLoading(false);
     }
   }, []);
 
@@ -350,6 +389,49 @@ export function ProfilePage() {
     });
   };
 
+  const retryDevices = async () => {
+    setDevicesLoading(true);
+    setDeviceLoadError(null);
+    try {
+      const response = await apiRequest("/api/v1/devices");
+      if (!response.ok) throw await apiErrorFromResponse(response, "Mobile and backup devices could not be loaded.");
+      setDevices(await response.json());
+    } catch (reason) {
+      setDeviceLoadError(reason instanceof PasskeyApiError ? reason.message : "Mobile and backup devices could not be loaded. Check the connection and try again.");
+    } finally {
+      setDevicesLoading(false);
+    }
+  };
+
+  const requestDeviceRevocation = (device: BackupDevice) => {
+    setDeviceRevocationError(null);
+    setDeviceToRevoke(device);
+  };
+
+  const cancelDeviceRevocation = useCallback(() => {
+    setDeviceRevocationError(null);
+    setDeviceToRevoke(null);
+  }, []);
+
+  const confirmDeviceRevocation = async () => {
+    const device = deviceToRevoke;
+    if (!device) return;
+    const action = `device-${device.id}`;
+    setBusyAction(action);
+    setDeviceRevocationError(null);
+    try {
+      const response = await apiRequest(`/api/v1/devices/${device.id}`, { method: "DELETE" });
+      if (!response.ok) throw await apiErrorFromResponse(response, "That device could not be disconnected.");
+      setDevices((current) => current.filter((item) => item.id !== device.id));
+      setDeviceToRevoke(null);
+      announce(`${device.name} disconnected. Its saved device credential can no longer access this account.`);
+    } catch (reason) {
+      setDeviceRevocationError(reason instanceof PasskeyApiError ? reason.message : "That device could not be disconnected. Check the connection and try again.");
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const enrollPasskey = async () => {
     if (!passkeySupported) {
       announce("Passkeys require a supported browser and a secure Drivebound address.", "error");
@@ -412,18 +494,67 @@ export function ProfilePage() {
       <aside>
         <div className="profile-avatar" aria-hidden="true">{(user.display_name ?? user.email)[0].toUpperCase()}</div>
         <h1>{user.display_name ?? "Drivebound account"}</h1><p>{user.email}</p>
-        <div className="profile-tablist" role="tablist" aria-label="Profile settings">{profileTabs.map((item) => <button key={item} id={`profile-tab-${item}`} role="tab" aria-selected={tab === item} aria-controls="profile-tabpanel" tabIndex={tab === item ? 0 : -1} className={tab === item ? "active" : ""} onClick={() => selectTab(item)} onKeyDown={(event) => handleTabKey(event, item)}>{item}</button>)}</div>
+        <div className="profile-tablist" role="tablist" aria-label="Profile settings">{profileTabs.map((item) => <button key={item} id={`profile-tab-${item}`} role="tab" aria-selected={tab === item} aria-controls="profile-tabpanel" tabIndex={tab === item ? 0 : -1} className={tab === item ? "active" : ""} onClick={() => selectTab(item)} onKeyDown={(event) => handleTabKey(event, item)}>{profileTabLabels[item]}</button>)}</div>
       </aside>
       <section className="profile-panel" id="profile-tabpanel" role="tabpanel" aria-labelledby={`profile-tab-${tab}`} tabIndex={-1} aria-busy={busyAction != null}>
         {loadError && <p className="profile-message error" role="alert">{loadError}</p>}
         {message && <p className={`profile-message ${messageTone === "error" ? "error" : ""}`} role={messageTone === "error" ? "alert" : "status"}>{message}</p>}
         {tab === "account" && <><span className="eyebrow">Profile</span><h2>Account information</h2><div className="status-card"><span className={`drive-light ${user.email_verified_at ? "online" : "unavailable"}`} aria-hidden="true" /><div><strong>{user.email_verified_at ? "Email verified" : "Email verification pending"}</strong><small>{user.email_verified_at ? new Date(user.email_verified_at).toLocaleString() : "Check your inbox for a verification link."}</small></div></div><form className="settings-form" onSubmit={updateProfile}><label>Display name<input value={name} onChange={(event) => setName(event.target.value)} autoComplete="name" /></label><label>Email address<input value={user.email} disabled /></label><button className="primary-button" disabled={busyAction != null}>{busyAction === "profile" ? "Saving..." : "Save profile"}</button></form></>}
         {tab === "security" && <><span className="eyebrow">Security</span><h2>Password, passkeys, and two-factor authentication</h2><form className="settings-form" onSubmit={changePassword}><h3>{user.has_password ? "Change password" : "Add a password"}</h3><p>{user.has_password ? "Confirm your current credentials before replacing your password." : "Create a password as another sign-in and recovery method. Drivebound will ask you to verify with Google or a passkey first."}</p>{user.has_password && <label>Current password<input type="password" required value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" /></label>}{user.has_password && user.two_factor_enabled && <label>Authenticator or recovery code<input required value={passwordChangeCode} onChange={(event) => setPasswordChangeCode(event.target.value)} autoComplete="one-time-code" /></label>}<label>{user.has_password ? "New password" : "Create password"}<input type="password" minLength={12} required value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" /></label><button className="primary-button" disabled={busyAction != null || !newPassword || (user.has_password && (!currentPassword || (user.two_factor_enabled && !passwordChangeCode.trim())))}>{busyAction === "password" ? user.has_password ? "Changing..." : "Adding..." : user.has_password ? "Change password" : "Add password"}</button></form><PasskeyManager credentials={passkeys.map((item) => ({ id: item.id, label: item.name, createdAt: item.created_at, lastUsedAt: item.last_used_at }))} supported={passkeySupported} platformAvailable={platformPasskey} busyAction={busyAction} onEnroll={() => void enrollPasskey()} onRename={(credentialId, label) => void updatePasskeyName(credentialId, label)} onRemove={(credentialId) => void deletePasskey(credentialId)} /><div className="settings-card"><h3>Authenticator app</h3><p>{user.two_factor_enabled ? "Two-factor authentication is protecting this account." : "Add a time-based code from any compatible authenticator app."}</p>{user.two_factor_enabled && <div className="mfa-setup">{user.has_password && <label>Password<input type="password" value={mfaPassword} onChange={(event) => setMfaPassword(event.target.value)} autoComplete="current-password" /></label>}{user.has_password && <label>Authenticator or recovery code<input value={mfaDisableCode} onChange={(event) => setMfaDisableCode(event.target.value)} autoComplete="one-time-code" /></label>}{!user.has_password && <p className="security-note">Fresh passkey verification, or Google verification plus your local authenticator or recovery factor, completes this proof. No second code is required here.</p>}<button type="button" className="secondary-button" disabled={busyAction != null || (user.has_password && (!mfaDisableCode || !mfaPassword))} onClick={() => void disableMfa()}>{busyAction === "mfa-disable" ? "Disabling..." : "Disable two-factor authentication"}</button></div>}{!user.two_factor_enabled && !mfaSecret && <button type="button" className="secondary-button" disabled={busyAction != null} onClick={() => void startMfa()}>{busyAction === "mfa-setup" ? "Starting setup..." : "Set up two-factor authentication"}</button>}{mfaSecret && <div className="mfa-setup"><label>Setup secret<input readOnly value={mfaSecret} onFocus={(event) => event.currentTarget.select()} /></label><details><summary>Authenticator URI</summary><code>{mfaUri}</code></details><label>Six-digit code<input inputMode="numeric" pattern="[0-9]*" value={mfaCode} onChange={(event) => setMfaCode(event.target.value)} autoComplete="one-time-code" /></label><button type="button" className="primary-button" disabled={busyAction != null || !mfaCode.trim()} onClick={() => void confirmMfa()}>{busyAction === "mfa-confirm" ? "Confirming..." : "Confirm and enable"}</button></div>}{recoveryCodes.length > 0 && <div className="recovery-codes" role="status"><strong>Save these one-time recovery codes now</strong>{recoveryCodes.map((code) => <code key={code}>{code}</code>)}</div>}</div></>}
-        {tab === "sessions" && <><span className="eyebrow">Devices</span><h2>Active sessions</h2><p>Revoke any browser or device you no longer recognize.</p><div className="session-list">{sessions.map((item) => <article key={item.id}><div><strong>{item.current ? "This device" : item.user_agent?.split(" ").slice(0, 3).join(" ") || "Unknown device"}</strong><span>{item.ip_address ?? "Unknown network"} - Last active {new Date(item.last_seen_at).toLocaleString()}</span></div>{!item.current && <button disabled={busyAction != null} onClick={() => void revokeSession(item)}>{busyAction === `session-${item.id}` ? "Revoking..." : "Revoke"}</button>}</article>)}{sessions.length === 0 && <p className="settings-empty">No active sessions were returned.</p>}</div></>}
+        {tab === "sessions" && <>
+          <span className="eyebrow">Account access</span>
+          <h2>Browsers and backup devices</h2>
+          <p>Browser sessions sign you into the web library. Mobile and backup devices use a separate, durable credential for automatic uploads.</p>
+          <section className="access-section" aria-labelledby="browser-sessions-title">
+            <h3 id="browser-sessions-title">Browser sessions</h3>
+            <p>Revoke a browser session you no longer recognize. Your current browser remains available here so you do not sign yourself out by mistake.</p>
+            <div className="session-list">
+              {sessions.map((item) => <article key={item.id}>
+                <div>
+                  <strong>{browserSessionName(item)}</strong>
+                  <span>{item.ip_address ?? "Unknown network"} - Last active <time dateTime={item.last_seen_at}>{new Date(item.last_seen_at).toLocaleString()}</time></span>
+                </div>
+                {!item.current && <button aria-label={`Revoke browser session ${browserSessionName(item)}`} disabled={busyAction != null} onClick={() => void revokeSession(item)}>{busyAction === `session-${item.id}` ? "Revoking..." : "Revoke session"}</button>}
+              </article>)}
+              {sessions.length === 0 && <p className="settings-empty">No active browser sessions were returned.</p>}
+            </div>
+          </section>
+          <section className="access-section" aria-labelledby="backup-devices-title">
+            <h3 id="backup-devices-title" tabIndex={-1}>Mobile and backup devices</h3>
+            <p>Disconnecting a device invalidates its saved credential and stops new backups. It does not delete media already stored in Drivebound.</p>
+            <div className="device-access-list" aria-busy={devicesLoading}>
+              {devicesLoading && <p className="settings-empty" role="status">Loading connected devices...</p>}
+              {!devicesLoading && deviceLoadError && <div className="device-list-error"><p role="alert">{deviceLoadError}</p><button className="secondary-button" type="button" onClick={() => void retryDevices()}>Try again</button></div>}
+              {!devicesLoading && !deviceLoadError && devices.map((device) => <article key={device.id}>
+                <div id={`device-summary-${device.id}`}>
+                  <strong>{device.name}</strong>
+                  <span>{device.platform} - Connected <time dateTime={device.created_at}>{new Date(device.created_at).toLocaleDateString()}</time></span>
+                  <span>{device.last_seen_at ? <>Last contact <time dateTime={device.last_seen_at}>{new Date(device.last_seen_at).toLocaleString()}</time></> : "No contact reported yet"}</span>
+                  <span>{device.last_backup_at ? <>Last backup <time dateTime={device.last_backup_at}>{new Date(device.last_backup_at).toLocaleString()}</time></> : "No completed backup reported"} - {device.files_backed_up.toLocaleString()} files - {formatBytes(device.bytes_backed_up)}</span>
+                </div>
+                <button
+                  type="button"
+                  aria-label={`Disconnect ${device.name}`}
+                  aria-describedby={`device-summary-${device.id}`}
+                  disabled={busyAction != null}
+                  onClick={() => requestDeviceRevocation(device)}
+                >Disconnect</button>
+              </article>)}
+              {!devicesLoading && !deviceLoadError && devices.length === 0 && <p className="settings-empty">No mobile or backup devices are connected.</p>}
+            </div>
+          </section>
+        </>}
         {tab === "activity" && <><span className="eyebrow">Audit trail</span><h2>Security history</h2><div className="session-list">{events.map((item) => <article key={item.id}><div><strong>{item.event_type.replaceAll("_", " ")}</strong><span>{new Date(item.created_at).toLocaleString()} - {item.ip_address ?? "Unknown network"}</span></div></article>)}{events.length === 0 && <p className="settings-empty">No security events were returned.</p>}</div></>}
         {tab === "data" && <><span className="eyebrow">Data control</span><h2>Export or delete your account</h2><div className="settings-card"><h3>Export account manifest</h3><p>Download account information and a list of every asset with its retrieval URL.</p><button className="secondary-button" disabled={busyAction != null} onClick={() => void exportAccount()}>{busyAction === "export" ? "Preparing export..." : "Download export"}</button></div><form className="settings-card danger-zone" onSubmit={deleteAccount}><h3>Delete account</h3><p>This permanently deletes your account and encryption key. Any retained orphaned bytes become inaccessible immediately and must be removed by the administrator during storage cleanup. This cannot be undone.</p>{user.has_password && <label>Password<input type="password" required value={deletePassword} onChange={(event) => setDeletePassword(event.target.value)} autoComplete="current-password" /></label>}{user.has_password && user.two_factor_enabled && <label>Authenticator or recovery code<input required value={deleteCode} onChange={(event) => setDeleteCode(event.target.value)} autoComplete="one-time-code" /></label>}{!user.has_password && <p className="security-note">Fresh passkey verification, or Google verification plus your local authenticator or recovery factor, completes the deletion proof. No second code is required here.</p>}<label>Type DELETE MY ACCOUNT<input required value={deleteConfirmation} onChange={(event) => setDeleteConfirmation(event.target.value)} autoComplete="off" /></label><button disabled={busyAction != null || deleteConfirmation !== "DELETE MY ACCOUNT" || (user.has_password && !deletePassword) || (user.has_password && user.two_factor_enabled && !deleteCode.trim())}>{busyAction === "delete" ? "Deleting account..." : "Delete my account"}</button></form></>}
       </section>
     </div>
+    <DeviceRevocationDialog
+      deviceName={deviceToRevoke?.name ?? null}
+      busy={deviceToRevoke != null && busyAction === `device-${deviceToRevoke.id}`}
+      error={deviceRevocationError}
+      onCancel={cancelDeviceRevocation}
+      onConfirm={() => void confirmDeviceRevocation()}
+    />
     <ReauthenticationDialog
       open={pendingSecurityAction != null}
       busyMethod={reauthMethod}

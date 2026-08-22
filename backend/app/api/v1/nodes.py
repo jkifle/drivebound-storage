@@ -9,7 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.security import current_user, opaque_token, token_digest
+from app.core.security import current_user, opaque_token, reject_suppressed_account, token_digest
 from app.db.session import get_db
 from app.models.node import NodePairingCode, PairedNode
 from app.models.user import User
@@ -76,6 +76,7 @@ async def claim_node(
     ).with_for_update())
     if pairing is None:
         raise HTTPException(status_code=400, detail="Pairing code is invalid or expired")
+    reject_suppressed_account(pairing.user_id)
     if settings.remote_access_enabled and payload.endpoint_url and payload.endpoint_url.scheme != "https":
         raise HTTPException(status_code=400, detail="Remote nodes require an HTTPS endpoint")
     secret = opaque_token(48)
@@ -110,6 +111,7 @@ async def node_from_secret(session: AsyncSession, secret: str | None, *, lock: b
     node = await session.scalar(statement)
     if node is None:
         raise HTTPException(status_code=401, detail="Invalid node token")
+    reject_suppressed_account(node.user_id)
     return node
 
 
@@ -199,74 +201,6 @@ async def list_nodes(session: AsyncSession = Depends(get_db), user: User = Depen
         if not node.last_seen_at or node.last_seen_at < stale_before:
             node.status = "offline"
     return nodes
-
-
-@router.get("/{node_id}/browse")
-async def browse_node(node_id: uuid.UUID, path: str = "", session: AsyncSession = Depends(get_db), user: User = Depends(current_user)) -> dict[str, object]:
-    node = await load_node_for_user(session, user, node_id)
-    if not node.endpoint_url:
-        raise HTTPException(status_code=400, detail="This node does not have an advertised endpoint URL.")
-    if not node.node_secret:
-        raise HTTPException(status_code=400, detail="This node is not configured for secure HTTP access. Re-pair the node to regenerate credentials.")
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.get(
-            f"{node.endpoint_url.rstrip('/')}/api/v1/files/browse",
-            params={"path": path},
-            headers={"X-Drivebound-Node-Auth": node.node_secret},
-        )
-    if not response.is_success:
-        raise HTTPException(status_code=response.status_code, detail=response.text or "Node browse failed")
-    return response.json()
-
-
-@router.get("/{node_id}/download")
-async def download_node_file(node_id: uuid.UUID, path: str, session: AsyncSession = Depends(get_db), user: User = Depends(current_user)) -> Response:
-    node = await load_node_for_user(session, user, node_id)
-    if not node.endpoint_url:
-        raise HTTPException(status_code=400, detail="This node does not have an advertised endpoint URL.")
-    if not node.node_secret:
-        raise HTTPException(status_code=400, detail="This node is not configured for secure HTTP access. Re-pair the node to regenerate credentials.")
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(
-            f"{node.endpoint_url.rstrip('/')}/api/v1/files/download",
-            params={"path": path},
-            headers={"X-Drivebound-Node-Auth": node.node_secret},
-        )
-    if not response.is_success:
-        raise HTTPException(status_code=response.status_code, detail=response.text or "Node file download failed")
-    filename = path.rsplit("/", 1)[-1] or "download"
-    return Response(content=response.content, media_type="application/octet-stream", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
-
-
-@router.post("/{node_id}/upload")
-async def upload_node_file(
-    node_id: uuid.UUID,
-    path: str,
-    file: UploadFile = File(...),
-    overwrite: bool = False,
-    session: AsyncSession = Depends(get_db),
-    user: User = Depends(current_user),
-) -> dict[str, object]:
-    node = await load_node_for_user(session, user, node_id)
-    if not node.endpoint_url:
-        raise HTTPException(status_code=400, detail="This node does not have an advertised endpoint URL.")
-    if not node.node_secret:
-        raise HTTPException(status_code=400, detail="This node is not configured for secure HTTP access. Re-pair the node to regenerate credentials.")
-
-    contents = await file.read()
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            f"{node.endpoint_url.rstrip('/')}/api/v1/files/upload",
-            params={"path": path, "overwrite": str(overwrite).lower()},
-            content=contents,
-            headers={
-                "X-Drivebound-Node-Auth": node.node_secret,
-                "Content-Type": "application/octet-stream",
-            },
-        )
-    if not response.is_success:
-        raise HTTPException(status_code=response.status_code, detail=response.text or "Node file upload failed")
-    return response.json()
 
 
 @router.delete("/{node_id}", status_code=status.HTTP_204_NO_CONTENT)

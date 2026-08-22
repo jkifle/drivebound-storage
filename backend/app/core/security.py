@@ -11,7 +11,7 @@ from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from jwt.exceptions import InvalidTokenError
 from pwdlib import PasswordHash
-from sqlalchemy import select, update
+from sqlalchemy import exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -19,11 +19,27 @@ from app.db.session import async_session_factory, get_db
 from app.models.auth import AuthSession
 from app.models.device import Device
 from app.models.user import User
+from app.services.account_deletion import suppression_subject_is_denied
 
 password_hash = PasswordHash.recommended()
 password_kdf_slots = asyncio.Semaphore(4)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/token", auto_error=False)
 RECENT_AUTH_HEADER = "X-Drivebound-Reauthentication"
+
+
+def reject_suppressed_account(user_id: uuid.UUID) -> None:
+    """Deny capabilities from an authoritative account-deletion marker."""
+    try:
+        suppressed = suppression_subject_is_denied(user_id)
+    except RuntimeError:
+        # Invalid or unavailable suppression evidence is an operational fault,
+        # but granting access would risk resurrecting a deleted account.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Account authorization is temporarily unavailable",
+        ) from None
+    if suppressed:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Account is unavailable")
 
 
 def hash_password(password: str) -> str:
@@ -96,6 +112,7 @@ async def current_auth(
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
     user_id, session_id = decode_access_claims(token)
+    reject_suppressed_account(user_id)
     if session_id is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session is no longer valid")
     now = datetime.now(timezone.utc)
@@ -128,6 +145,7 @@ async def current_auth(
                     AuthSession.revoked_at.is_(None),
                     AuthSession.expires_at > now,
                     AuthSession.last_seen_at < now - timedelta(minutes=5),
+                    exists().where(User.id == user_id, User.disabled_at.is_(None)),
                 )
                 .values(last_seen_at=now)
             )
@@ -180,6 +198,7 @@ async def current_user_or_device(
     if x_device_token:
         device = await session.scalar(select(Device).where(Device.token_hash == token_digest(x_device_token)))
         if device is not None:
+            reject_suppressed_account(device.user_id)
             user = await session.get(User, device.user_id)
             if user is not None and user.disabled_at is None:
                 device.last_seen_at = datetime.now(timezone.utc)

@@ -38,6 +38,10 @@ celery_app.conf.update(
             "task": "purge_expired_assets",
             "schedule": settings.lifecycle_purge_interval_seconds,
         },
+        "dispatch-account-deletions": {
+            "task": "dispatch_account_deletions",
+            "schedule": settings.account_deletion_dispatch_interval_seconds,
+        },
         "backup-and-verify-operational-state": {
             "task": "backup_operational_state",
             "schedule": settings.database_backup_interval_hours * 60 * 60,

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 import hashlib
 from datetime import datetime
@@ -10,15 +11,43 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.asset import Asset
 from app.models.user import User
-from app.services.encryption import generate_user_media_key, unwrap_user_media_key, wrap_user_media_key
-from app.services.storage import commit_encrypted_original, commit_original, original_path_for, sha256_file
+from app.services.encryption import (
+    generate_user_media_key,
+    iter_decrypted_chunks,
+    unwrap_user_media_key,
+    wrap_user_media_key,
+)
+from app.services.storage import (
+    commit_encrypted_original,
+    commit_original,
+    canonical_storage_path,
+    lock_storage_path,
+    original_path_for,
+    sha256_file,
+)
 
 
-def user_media_key(user: User) -> bytes:
-    """Create an account DEK lazily, so existing accounts need no migration job."""
+def initialize_user_media_key(user: User) -> bytes:
+    """Initialize a DEK while the caller holds the User row exclusively.
+
+    The caller must commit this wrapped key before publishing ciphertext.  Key
+    creation is intentionally separate from ``user_media_key`` so a future
+    read/write caller cannot accidentally recreate the old key-loss window.
+    """
+    if user.disabled_at is not None:
+        raise ValueError("Cannot initialize a media key for a disabled account")
     if user.media_key_encrypted is None:
         user.media_key_encrypted = wrap_user_media_key(generate_user_media_key())
         user.media_key_version = 1
+    return unwrap_user_media_key(user.media_key_encrypted)
+
+
+def user_media_key(user: User) -> bytes:
+    """Unwrap an already-durable account DEK without mutating the account."""
+    if user.disabled_at is not None:
+        raise ValueError("Cannot unwrap a media key for a disabled account")
+    if user.media_key_encrypted is None:
+        raise ValueError("Account media key has not been initialized")
     return unwrap_user_media_key(user.media_key_encrypted)
 
 
@@ -26,6 +55,17 @@ def ingestion_lock_key(user_id: uuid.UUID, checksum: str) -> int:
     """Stable signed bigint used to serialize same-account deduplication."""
     digest = hashlib.sha256(user_id.bytes + checksum.encode("ascii")).digest()
     return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+
+def encrypted_plaintext_checksum(path: Path, key: bytes, expected_size: int | None = None) -> str:
+    digest = hashlib.sha256()
+    size = 0
+    for chunk in iter_decrypted_chunks(path, key):
+        digest.update(chunk)
+        size += len(chunk)
+    if expected_size is not None and size != expected_size:
+        raise ValueError("Existing encrypted object has an unexpected plaintext size")
+    return digest.hexdigest()
 
 
 async def persist_managed_asset(
@@ -42,6 +82,30 @@ async def persist_managed_asset(
     logical_id: uuid.UUID | None = None,
     force_new_version: bool = False,
 ) -> tuple[Asset, bool]:
+    # User -> advisory content/path lock -> Asset is the global ingestion lock
+    # order. Account deletion takes User FOR UPDATE, so it waits for any writer
+    # that already started and every losing writer observes ``disabled_at``.
+    # Exclusive because the first upload may initialize the per-account DEK;
+    # two concurrent first uploads must never publish under different keys.
+    user = await session.scalar(
+        select(User).where(User.id == user_id, User.disabled_at.is_(None)).with_for_update()
+    )
+    if user is None:
+        staged_path.unlink(missing_ok=True)
+        raise ValueError("Cannot store media for a missing or disabled account")
+    encryption_version = 1 if settings.media_encryption_enabled else 0
+    if encryption_version and user.media_key_encrypted is None:
+        # The wrapped DEK must be durable before any ciphertext is published.
+        # A crash after file publication can then be retried with the same key
+        # rather than silently adopting bytes encrypted under a discarded key.
+        initialize_user_media_key(user)
+        await session.commit()
+        user = await session.scalar(
+            select(User).where(User.id == user_id, User.disabled_at.is_(None)).with_for_update()
+        )
+        if user is None:
+            staged_path.unlink(missing_ok=True)
+            raise ValueError("Cannot store media for a missing or disabled account")
     if not force_new_version:
         # Migration 0014 permits equal content in different immutable version
         # histories. A transaction-scoped advisory lock preserves ordinary
@@ -58,14 +122,15 @@ async def persist_managed_asset(
             staged_path.unlink(missing_ok=True)
             return existing, True
 
-    user = await session.get(User, user_id)
-    if user is None:
-        staged_path.unlink(missing_ok=True)
-        raise ValueError("Cannot store media for a missing account")
-    encryption_version = 1 if settings.media_encryption_enabled else 0
-    final_path = original_path_for(checksum, filename, user_id if encryption_version else None)
+    final_path = original_path_for(checksum, filename, user_id if encryption_version else None).resolve()
+    await lock_storage_path(session, final_path)
     if encryption_version:
-        commit_encrypted_original(staged_path, final_path, user_media_key(user))
+        key = user_media_key(user)
+        created = commit_encrypted_original(staged_path, final_path, key)
+        if not created and await asyncio.to_thread(
+            encrypted_plaintext_checksum, final_path, key, file_size
+        ) != checksum:
+            raise ValueError("Existing encrypted original does not authenticate as the uploaded content")
     else:
         commit_original(staged_path, final_path)
     item_id = logical_id or uuid.uuid4()
@@ -78,7 +143,7 @@ async def persist_managed_asset(
         user_id=user_id,
         logical_id=item_id,
         version=version,
-        original_path=str(final_path),
+        original_path=canonical_storage_path(final_path),
         checksum=checksum,
         storage_checksum=sha256_file(final_path),
         encryption_version=encryption_version,

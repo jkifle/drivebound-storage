@@ -24,6 +24,8 @@ from typing import Iterable
 HTTP_METHODS = ("DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT", "other")
 TASK_NAMES = (
     "backup_operational_state",
+    "cleanup_account_deletion",
+    "dispatch_account_deletions",
     "group_media",
     "index_asset",
     "migrate_legacy_media",
@@ -49,6 +51,8 @@ RECOVERY_OUTCOMES = ("failed", "queued", "skipped", "success", "unrecoverable")
 
 _TASK_QUEUE = {
     "backup_operational_state": "backup",
+    "cleanup_account_deletion": "lifecycle",
+    "dispatch_account_deletions": "lifecycle",
     "group_media": "intelligence",
     "index_asset": "intelligence",
     "migrate_legacy_media": "lifecycle",

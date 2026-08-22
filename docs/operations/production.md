@@ -39,6 +39,28 @@ trusted proxy must replace, not blindly append to, any client-supplied
 The CI workflow validates backend tests, mobile type checking, frontend build,
 Docker configuration, and an Alembic upgrade from an empty PostgreSQL volume.
 
+## Account-deletion rollout and rollback
+
+Migration `0017` introduces durable deletion jobs and makes inviter attribution
+nullable. Before exposing account deletion, block the deletion endpoint at the
+ingress, apply the migration, deploy the new application image, and drain every
+pre-`0017` Celery worker. Start only workers and the scheduler from the new
+image, verify the independent suppression-ledger mount is durable, then reopen
+the endpoint. Older workers do not have the account/path fences required by the
+deletion workflow.
+
+Schema rollback is intentionally not automatic. Stop new deletion requests,
+pause the scheduler, drain current workers and queues, and reconcile every
+pending/retry/running deletion before stopping the application. Archive the
+suppression ledger and deletion evidence outside the rollback target. The
+`0017` downgrade refuses to run while any deletion-job row remains or while a
+preserved album membership has null inviter attribution; both conditions need
+an explicit, reviewed data migration. Only after evidence is archived and the
+database is reconciled may operators remove those rows, stop all new-version
+processes, downgrade to `0016`, and start the old application and workers.
+
+Follow the complete [account-deletion operations runbook](account-deletion.md).
+
 ## Observability and recovery
 
 The API emits correlation-aware request logs and exposes Prometheus text metrics

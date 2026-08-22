@@ -7,7 +7,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.security import current_user, current_user_or_device
+from app.core.security import current_user, current_user_or_device, reject_suppressed_account
 from app.db.session import get_db
 from app.models.asset import Asset
 from app.models.album import Album, AlbumAsset, AlbumMember
@@ -26,13 +26,25 @@ from app.worker.tasks import process_asset_task, protect_asset_task, restore_ass
 router = APIRouter(prefix="/assets", tags=["assets"])
 
 
+async def lock_active_asset_writer(session: AsyncSession, user_id: uuid.UUID) -> User:
+    """Fence stale lifecycle writes against the account-deletion User lock."""
+    user = await session.scalar(
+        select(User)
+        .where(User.id == user_id, User.disabled_at.is_(None))
+        .with_for_update(read=True)
+    )
+    if user is None:
+        raise HTTPException(status_code=409, detail="Account is unavailable")
+    return user
+
+
 async def asset_by_checksum(session: AsyncSession, user_id: uuid.UUID, checksum: str) -> Asset | None:
     return await session.scalar(select(Asset).where(Asset.user_id == user_id, Asset.checksum == checksum))
 
 
 async def readable_asset(session: AsyncSession, user_id: uuid.UUID, asset_id: uuid.UUID) -> Asset | None:
     """Allow an owner or a member of an album containing the asset to read it."""
-    return await session.scalar(
+    asset = await session.scalar(
         select(Asset)
         .outerjoin(AlbumAsset, AlbumAsset.asset_id == Asset.id)
         .outerjoin(Album, Album.id == AlbumAsset.album_id)
@@ -44,6 +56,14 @@ async def readable_asset(session: AsyncSession, user_id: uuid.UUID, asset_id: uu
         )
         .distinct()
     )
+    if asset is not None:
+        try:
+            reject_suppressed_account(asset.user_id)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+                return None
+            raise
+    return asset
 
 
 def timeline_statement(user_id: uuid.UUID, limit: int, cursor: TimelineCursor | None = None):
@@ -146,7 +166,13 @@ async def restore_from_trash(
     session: AsyncSession = Depends(get_db),
     user: User = Depends(current_user),
 ) -> AssetRevisionResponse:
-    asset = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
+    locked_user = await lock_active_asset_writer(session, user.id)
+    asset = await session.scalar(
+        select(Asset)
+        .where(Asset.id == asset_id, Asset.user_id == locked_user.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     if asset is None:
         raise HTTPException(status_code=404, detail="Asset not found")
     try:
@@ -181,8 +207,16 @@ async def rollback_to_version(
     session: AsyncSession = Depends(get_db),
     user: User = Depends(current_user),
 ) -> AssetRevisionResponse:
-    current = await session.scalar(select(Asset).where(Asset.id == asset_id, Asset.user_id == user.id))
-    target = await session.scalar(select(Asset).where(Asset.id == version_id, Asset.user_id == user.id))
+    locked_user = await lock_active_asset_writer(session, user.id)
+    revisions = list((await session.scalars(
+        select(Asset)
+        .where(Asset.id.in_({asset_id, version_id}), Asset.user_id == locked_user.id)
+        .order_by(Asset.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).all())
+    current = next((revision for revision in revisions if revision.id == asset_id), None)
+    target = next((revision for revision in revisions if revision.id == version_id), None)
     if current is None or target is None:
         raise HTTPException(status_code=404, detail="Asset revision not found")
     try:
@@ -245,7 +279,7 @@ async def upload_asset(
     session: AsyncSession = Depends(get_db),
     user: User = Depends(current_user_or_device),
 ) -> UploadResponse:
-    staged_path, checksum, file_size = await stage_upload(file)
+    staged_path, checksum, file_size = await stage_upload(file, user.id)
     asset, duplicate = await persist_managed_asset(
         session,
         user_id=user.id,

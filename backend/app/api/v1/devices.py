@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import opaque_token, token_digest
+from app.core.security import opaque_token, reject_suppressed_account, token_digest
 from app.core.security import current_user
 from app.db.session import get_db
 from app.models.asset import Asset
@@ -23,6 +23,7 @@ async def authenticated_device(session: AsyncSession, device_token: str | None) 
     device = await session.scalar(select(Device).where(Device.token_hash == token_digest(device_token)))
     if device is None:
         raise HTTPException(status_code=401, detail="Invalid device token")
+    reject_suppressed_account(device.user_id)
     device.last_seen_at = datetime.now(timezone.utc)
     return device
 

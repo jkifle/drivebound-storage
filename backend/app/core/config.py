@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     database_backup_retention_days: int = 30
     lifecycle_retention_days: int = 30
     lifecycle_purge_interval_seconds: int = 3600
+    account_deletion_dispatch_interval_seconds: int = 60
+    account_deletion_lease_seconds: int = 900
+    account_deletion_retry_base_seconds: int = 30
+    account_deletion_retry_max_seconds: int = 3600
+    account_deletion_batch_size: int = 25
+    account_deletion_quiescence_seconds: int = 0
     auto_protect_uploads: bool = True
     resumable_chunk_size: int = 8 * 1024 * 1024
     upload_session_hours: int = 24
@@ -91,6 +97,11 @@ class Settings(BaseSettings):
     metrics_auth_token: str | None = None
     metrics_auth_token_file: Path | None = None
 
+    @property
+    def account_deletion_ledger_path(self) -> Path:
+        """Independent suppression ledger retained beside database archives."""
+        return self.backups_path / "account-deletion-suppressions"
+
     @model_validator(mode="after")
     def load_file_backed_secrets(self) -> "Settings":
         for field in (
@@ -112,6 +123,20 @@ class Settings(BaseSettings):
                 if not value:
                     raise ValueError(f"{field.upper()}_FILE is empty")
                 setattr(self, field, value)
+        positive_deletion_settings = {
+            "ACCOUNT_DELETION_DISPATCH_INTERVAL_SECONDS": self.account_deletion_dispatch_interval_seconds,
+            "ACCOUNT_DELETION_LEASE_SECONDS": self.account_deletion_lease_seconds,
+            "ACCOUNT_DELETION_RETRY_BASE_SECONDS": self.account_deletion_retry_base_seconds,
+            "ACCOUNT_DELETION_RETRY_MAX_SECONDS": self.account_deletion_retry_max_seconds,
+            "ACCOUNT_DELETION_BATCH_SIZE": self.account_deletion_batch_size,
+        }
+        invalid = [name for name, value in positive_deletion_settings.items() if value <= 0]
+        if invalid:
+            raise ValueError(f"{', '.join(invalid)} must be positive")
+        if self.account_deletion_retry_max_seconds < self.account_deletion_retry_base_seconds:
+            raise ValueError("ACCOUNT_DELETION_RETRY_MAX_SECONDS must be at least the base retry interval")
+        if self.account_deletion_quiescence_seconds < 0:
+            raise ValueError("ACCOUNT_DELETION_QUIESCENCE_SECONDS cannot be negative")
         return self
 
     @property

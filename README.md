@@ -4,17 +4,32 @@ Drivebound is an expandable personal cloud backed by drives you own. It provides
 
 ## Start
 
-1. Copy `.env.example` to `.env`.
-2. Change `POSTGRES_PASSWORD` in both `POSTGRES_PASSWORD` and `DATABASE_URL`.
-3. Replace `JWT_SECRET` with a long random value.
-4. Run `docker compose up --build -d`.
-5. Open <http://localhost:3000>, create an account, and complete setup.
+On Windows, double-click **Drivebound Setup** in the project folder. The guided
+setup lets you choose an existing photo folder, new-upload storage, and an
+optional second protection drive. It creates the database password, encryption
+key, authentication secrets, storage folders, and private Docker configuration
+automatically. It then starts Drivebound and opens the account-creation page.
 
-The backend applies Alembic migrations through `0015` before starting. Confirm the current migration with:
+Future use requires only **Drivebound Start** and **Drivebound Stop**. Stopping
+the application never deletes photos or accounts. Running setup again preserves
+the existing encryption key and account data.
+
+See the [guided Windows setup](docs/operations/windows-setup.md) for the complete
+storage and recovery explanation.
+
+For command-line or non-Windows development, copy `.env.example` to `.env`,
+replace every placeholder secret, and run `docker compose up --build -d`.
+
+The backend applies Alembic migrations through `0017` before starting. Confirm the current migration with:
 
 ```text
 docker compose exec backend alembic current
 ```
+
+If an older database reports exactly `0014`, follow the
+[duplicate-revision reconciliation note](docs/operations/migration-reconciliation.md)
+before upgrading; that revision briefly existed in an ambiguous development
+branch and must be identified from its schema markers.
 
 Service health is available at <http://localhost:8000/api/v1/health>. Interactive API documentation is available at <http://localhost:8000/docs>.
 
@@ -24,9 +39,9 @@ Registration, login, logout, current-user lookup, and onboarding are implemented
 
 Assets, resumable uploads, libraries, devices, albums, storage status, protection actions, and share creation are account-scoped. Duplicate detection is scoped per account so one user cannot discover another user's files through checksum responses.
 
-Email verification, password recovery and changes, rotating revocable refresh sessions, active-device controls, security history, Redis-backed login throttling, authenticator-app MFA with one-use recovery codes, account export/deletion, and a trusted-host recovery command are implemented. Before broad internet exposure, configure SMTP and a trusted HTTPS ingress, replace both secrets, and set `AUTH_COOKIE_SECURE=true`.
+Email verification, password recovery and changes, rotating revocable refresh sessions, active-device controls, security history, Redis-backed login throttling, authenticator-app MFA with one-use recovery codes, account export/deletion, and a trusted-host recovery command are implemented. Account deletion immediately disables live access and destroys the live account media key, then a leased background job removes catalog-owned managed bytes. It does not instantly erase historical database/off-site archives; operators must preserve and replay the independent suppression ledger until every older recovery copy has been disposed of. See the [account-deletion runbook](docs/operations/account-deletion.md). Before broad internet exposure, configure SMTP and a trusted HTTPS ingress, replace both secrets, and set `AUTH_COOKIE_SECURE=true`.
 
-Local development uses `EMAIL_DELIVERY_MODE=console`; verification and reset screens expose their development-only links. Production must use `EMAIL_DELIVERY_MODE=smtp` and configure `SMTP_HOST`, `SMTP_FROM`, and any required credentials. Administrative recovery is deliberately not exposed over HTTP; run `.venv\Scripts\python.exe tools\account_recovery.py --help` from the project folder on a trusted host.
+Local development uses `EMAIL_DELIVERY_MODE=console`; verification and reset screens expose their development-only links. Production must use `EMAIL_DELIVERY_MODE=smtp` and configure `SMTP_HOST`, `SMTP_FROM`, and any required credentials. Administrative recovery is deliberately not exposed over HTTP; run `.venv\Scripts\python.exe tools\account_recovery.py --help` from the project folder on a trusted host. It securely prompts for a replacement password (or reads a restricted password file) and revokes sessions, mobile devices, paired nodes, passkeys, MFA/recovery codes, pending account tokens, WebAuthn challenges, and linked external identities.
 
 ### Google sign-in
 
@@ -73,6 +88,8 @@ Files use immutable revisions. Moving an item to **Trash** records an audit even
 The scheduler writes deduplicated configuration snapshots and periodic logical PostgreSQL archives under `BACKUPS_PATH`. Each database archive is checked with `pg_restore --list` before it counts as verified. Archives older than `DATABASE_BACKUP_RETENTION_DAYS` are pruned. Review their verification state in **Storage**.
 
 `GET /api/v1/storage/recovery` provides an authenticated readiness summary without exposing host paths, checksums, or secrets. Account-scoped `POST /api/v1/monitoring/verify` performs a non-destructive checksum scan; `POST /api/v1/monitoring/run` also permits safe repair from verified copies. Follow the [recovery drill runbook](docs/operations/recovery-drill.md) for isolated PostgreSQL and media restore testing.
+
+Deleting an account is separate from ordinary Trash retention. Drivebound keeps a crash-resumable deletion job and a pseudonymous suppression marker under `BACKUPS_PATH/account-deletion-suppressions`. The worker removes catalog-owned managed originals, derivatives, replicas, staging files, and account-scoped orphan bytes while never deleting external-library originals. Canonical cross-kind reference checks protect legacy aliases; unsafe or ambiguous paths stop in `manual_review` instead of being reported as erased. Historical archives remain subject to the suppression-ledger and retention procedure, so operators must still complete the live deletion-and-restore acceptance gate before making a production erasure claim.
 
 ## Browser upload
 
@@ -136,6 +153,10 @@ Storage nodes pair through a single-use 10-minute code. On the node host run:
 python tools\drivebound_node.py http://localhost:8000 --pair-code ABCD1234 --name "Basement drive"
 ```
 
+`tools/drivebound_node.py` is the supported dependency-free Ed25519 node
+client. The incompatible experimental standalone `node_service` package and
+its installer wrappers were removed and must not be deployed.
+
 The node generates a local Ed25519 identity, proves possession when claiming the
 code, and signs every heartbeat. Its private key and returned node secret are
 written atomically with restricted permissions under `%LOCALAPPDATA%\Drivebound`
@@ -171,7 +192,7 @@ Add `-Docker` to validate both Compose configurations and `-Android` to build th
 
 ## Current product status
 
-- **Account access:** registration, login, HTTP-only sessions, logout, onboarding, and mandatory owner filtering are implemented.
+- **Account access:** registration, login, HTTP-only sessions, logout, onboarding, mandatory owner filtering, passkeys/recent authentication, and durable account-deletion intent are implemented. Production deletion acceptance still requires staging restore-replay and physical-erasure evidence.
 - **Mobile experience:** a native Expo library, discovery, sharing, restore, SQLite-backed resumable transfer queue, policy controls, local/Expo push notifications, and OS-scheduled background backup are implemented.
 - **Storage lifecycle:** multi-drive verified replica policies, safe balancing, immutable revisions, rollback, Trash retention, audited purge, and operational backup verification are implemented.
 - **Desktop sync:** selective folder roots use durable local/server journals, explicit delete tombstones, resumable transfers, reconnect cursors, and visible conflict records.

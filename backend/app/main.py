@@ -1,6 +1,8 @@
 import uuid
 import secrets
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, status
@@ -11,14 +13,42 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from app.api.v1.router import router as api_v1_router
 from app.core.config import settings
 from app.core.observability import configure_logging, log_request, metrics, request_timer
-from app.db.session import engine
+from app.db.session import async_session_factory, engine
+from app.services.account_deletion import ensure_suppression_ledger_ready, reconcile_suppression_ledger
+
+
+def _configured_paths_overlap(first: Path, second: Path) -> bool:
+    """Compare configured roots using platform filesystem case semantics."""
+    first_identity = Path(os.path.normcase(os.path.abspath(str(first.resolve(strict=False)))))
+    second_identity = Path(os.path.normcase(os.path.abspath(str(second.resolve(strict=False)))))
+    return (
+        first_identity == second_identity
+        or first_identity.is_relative_to(second_identity)
+        or second_identity.is_relative_to(first_identity)
+    )
 
 
 def runtime_configuration_errors() -> list[str]:
     unsafe: list[str] = []
     unsafe.extend(settings.webauthn_configuration_errors)
     public_access = settings.remote_access_enabled or settings.production_like
+    owned_roots = [
+        settings.originals_path,
+        settings.derivatives_path,
+        settings.staging_path,
+        settings.backups_path,
+        settings.replica_path,
+        *settings.replica_root_list,
+    ]
+    if any(
+        _configured_paths_overlap(external, owned)
+        for external in settings.external_root_list
+        for owned in owned_roots
+    ):
+        unsafe.append("EXTERNAL_LIBRARY_ROOTS must not overlap Drivebound-managed storage roots")
     if public_access:
+        if not settings.account_deletion_ledger_path.is_dir():
+            unsafe.append("the independently persisted account-deletion suppression ledger directory is missing")
         if not settings.app_url.startswith("https://") or not settings.api_url.startswith("https://"):
             unsafe.append("APP_URL and API_URL must use HTTPS")
         if not settings.auth_cookie_secure:
@@ -80,6 +110,13 @@ async def lifespan(app: FastAPI):
     if unsafe:
         raise RuntimeError("Unsafe deployment configuration: " + "; ".join(unsafe))
     configure_logging(settings.observability_log_json)
+    # Restore suppression is a pre-traffic invariant. A periodic worker is the
+    # recovery net for later broker failures, but a restored pre-deletion dump
+    # must be reconciled before any resurrected credential can be used.
+    ensure_suppression_ledger_ready()
+    async with async_session_factory() as session:
+        await reconcile_suppression_ledger(session)
+        await session.commit()
     yield
     await engine.dispose()
 
