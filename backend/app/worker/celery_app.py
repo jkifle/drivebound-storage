@@ -4,6 +4,7 @@ from celery import Celery, signals
 
 from app.core.config import settings
 from app.core.observability import bounded_task_name, log_operation, metrics
+from app.services.readiness import publish_heartbeat
 
 celery_app = Celery("photos", broker=settings.redis_url, backend=settings.redis_url)
 
@@ -29,6 +30,7 @@ celery_app.conf.update(
     task_track_started=True,
     worker_prefetch_multiplier=1,
     task_acks_late=True,
+    beat_scheduler="app.worker.heartbeat:PilotScheduler",
     beat_schedule={
         "verify-storage-and-recover": {
             "task": "monitor_storage",
@@ -107,3 +109,9 @@ def record_task_completion(sender: object = None, task: object = None, state: ob
 @signals.heartbeat_sent.connect
 def record_worker_heartbeat(**_kwargs: object) -> None:
     metrics.operations.worker_heartbeat()
+    publish_heartbeat("worker")
+
+
+@signals.worker_ready.connect
+def record_worker_ready(**_kwargs: object) -> None:
+    publish_heartbeat("worker")

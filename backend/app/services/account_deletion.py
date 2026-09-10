@@ -35,6 +35,7 @@ from app.models.share import ShareLink
 from app.models.upload_session import UploadSession
 from app.models.user import User
 from app.services.lifecycle import safely_purge_asset, safely_unlink_catalog_path
+from app.services.host_storage import require_storage, require_storage_path
 
 
 def _utc(value: datetime) -> datetime:
@@ -70,6 +71,7 @@ def ensure_suppression_ledger_ready(*, require_existing: bool | None = None) -> 
     mount; silently creating it on the application filesystem after a restore
     would make an empty/missing ledger indistinguishable from no deletions.
     """
+    require_storage("backups")
     directory = settings.account_deletion_ledger_path
     required = (
         settings.remote_access_enabled or settings.production_like
@@ -392,6 +394,7 @@ async def sweep_account_namespaces(session: AsyncSession, subject_id: uuid.UUID)
     """
     from app.services.storage import canonical_storage_path
 
+    require_storage("originals", "derivatives", "staging", "replicas", "backups")
     protected = await _canonical_live_paths(session)
     namespaces: list[tuple[Path, Path, bool]] = []
     retained = 0
@@ -412,6 +415,7 @@ async def sweep_account_namespaces(session: AsyncSession, subject_id: uuid.UUID)
         namespaces.append((resolved_root / str(subject_id), resolved_root, True))
 
     for namespace, root, replica_root in namespaces:
+        require_storage_path(namespace)
         if not namespace.exists():
             continue
         if not namespace.is_dir():
@@ -447,11 +451,13 @@ async def sweep_account_namespaces(session: AsyncSession, subject_id: uuid.UUID)
                 if not removed:
                     retained += 1
             elif candidate.is_dir():
+                require_storage_path(candidate)
                 try:
                     candidate.rmdir()
                 except OSError:
                     pass
         try:
+            require_storage_path(namespace)
             namespace.rmdir()
         except OSError:
             pass
@@ -482,6 +488,7 @@ async def process_account_deletion_batch(
             .with_for_update(skip_locked=True)
         )
         try:
+            require_storage("originals", "derivatives", "staging", "replicas", "backups")
             if upload is not None:
                 if not upload.staging_path.startswith("duplicate:"):
                     await safely_unlink_catalog_path(

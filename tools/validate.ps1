@@ -35,6 +35,10 @@ Invoke-ValidationStep "Guided Windows setup contract" $ProjectRoot {
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot "tools\test-setup.ps1")
 }
 
+Invoke-ValidationStep "Private remote access contract" $ProjectRoot {
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot "tools\test-remote-access.ps1")
+}
+
 Invoke-ValidationStep "Backend tests" (Join-Path $ProjectRoot "backend") {
     & $Python -m pytest tests -q
 }

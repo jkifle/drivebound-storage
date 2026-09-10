@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.asset import Asset
 from app.models.user import User
+from app.services.host_storage import require_storage, require_storage_path
 from app.services.encryption import (
     generate_user_media_key,
     iter_decrypted_chunks,
@@ -82,6 +83,8 @@ async def persist_managed_asset(
     logical_id: uuid.UUID | None = None,
     force_new_version: bool = False,
 ) -> tuple[Asset, bool]:
+    require_storage("originals", "staging")
+    require_storage_path(staged_path)
     # User -> advisory content/path lock -> Asset is the global ingestion lock
     # order. Account deletion takes User FOR UPDATE, so it waits for any writer
     # that already started and every losing writer observes ``disabled_at``.
@@ -131,6 +134,9 @@ async def persist_managed_asset(
             encrypted_plaintext_checksum, final_path, key, file_size
         ) != checksum:
             raise ValueError("Existing encrypted original does not authenticate as the uploaded content")
+        if not created:
+            require_storage_path(staged_path)
+            staged_path.unlink(missing_ok=True)
     else:
         commit_original(staged_path, final_path)
     item_id = logical_id or uuid.uuid4()

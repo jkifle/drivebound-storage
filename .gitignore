@@ -2,6 +2,9 @@
 .env.*
 !.env.example
 docker-compose.user.yml
+docker-compose.remote.yml
+.drivebound/
+**/.drivebound-identities/
 .secrets/
 .drivebound-node.json
 *.drivebound-node*.tmp

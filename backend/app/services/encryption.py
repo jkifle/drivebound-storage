@@ -17,6 +17,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from app.core.config import settings
+from app.services.host_storage import require_storage_path
 
 FORMAT_MAGIC = b"DRIVEBOUND-ENC-V1\x00"
 NONCE_SIZE = 12
@@ -58,6 +59,8 @@ def encrypt_file(source: Path, destination: Path, key: bytes) -> None:
     The destination is never overwritten. A pre-existing destination is treated
     as a completed concurrent write and raises ``FileExistsError``.
     """
+    require_storage_path(source)
+    require_storage_path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = _temporary_path(destination, "encrypt")
     nonce = os.urandom(NONCE_SIZE)
@@ -67,6 +70,7 @@ def encrypt_file(source: Path, destination: Path, key: bytes) -> None:
             output_file.write(FORMAT_MAGIC)
             output_file.write(nonce)
             while chunk := input_file.read(CHUNK_SIZE):
+                require_storage_path(destination)
                 output_file.write(encryptor.update(chunk))
             output_file.write(encryptor.finalize())
             output_file.write(encryptor.tag)
@@ -75,6 +79,7 @@ def encrypt_file(source: Path, destination: Path, key: bytes) -> None:
         try:
             # os.replace would silently overwrite a concurrent upload. Publish
             # through a hard link instead, which is atomic and exclusive.
+            require_storage_path(destination)
             os.link(temporary, destination)
         except FileExistsError:
             raise
@@ -87,6 +92,8 @@ def encrypt_file(source: Path, destination: Path, key: bytes) -> None:
 
 def decrypt_file(source: Path, destination: Path, key: bytes) -> None:
     """Authenticate and atomically decrypt a Drivebound encrypted file."""
+    require_storage_path(source)
+    require_storage_path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = _temporary_path(destination, "decrypt")
     try:
@@ -118,6 +125,7 @@ def decrypt_file(source: Path, destination: Path, key: bytes) -> None:
                 output_file.flush()
                 os.fsync(output_file.fileno())
         try:
+            require_storage_path(destination)
             os.link(temporary, destination)
         except FileExistsError:
             raise
@@ -130,6 +138,7 @@ def decrypt_file(source: Path, destination: Path, key: bytes) -> None:
 
 def iter_decrypted_chunks(source: Path, key: bytes) -> Iterator[bytes]:
     """Yield authenticated-by-GCM-on-completion plaintext for HTTP streaming."""
+    require_storage_path(source)
     with source.open("rb") as input_file:
         header = input_file.read(len(FORMAT_MAGIC) + NONCE_SIZE)
         if len(header) != len(FORMAT_MAGIC) + NONCE_SIZE or not header.startswith(FORMAT_MAGIC):

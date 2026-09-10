@@ -31,6 +31,10 @@ from app.services.ingestion import encrypted_plaintext_checksum, initialize_user
 from app.services.encryption import encrypt_file
 from app.services.intelligence import embed_text, extract_ocr
 from app.services.notifications import notify_user_devices
+from app.services.host_storage import (
+    StorageUnavailableError, configured_owner_email, require_host_owner,
+    require_storage, require_storage_path,
+)
 from app.services.storage import (
     canonical_storage_path,
     commit_encrypted_derivative,
@@ -139,6 +143,8 @@ def _json_value(value: object) -> object:
 
 
 def extract_and_thumbnail(original: Path, thumbnail: Path, fallback: datetime) -> dict[str, object]:
+    require_storage_path(original)
+    require_storage_path(thumbnail)
     with Image.open(original) as image:
         raw_exif = image.getexif()
         exif = {ExifTags.TAGS.get(key, str(key)): value for key, value in raw_exif.items()}
@@ -240,6 +246,7 @@ def extract_video_metadata(original: Path, fallback: datetime) -> dict[str, obje
 def plaintext_asset_file(asset: Asset, user: User | None) -> Iterator[Path]:
     """Provide plaintext to a processor without leaving it in permanent storage."""
     source = Path(asset.original_path)
+    require_storage_path(source)
     if asset.encryption_version:
         if user is None:
             raise ValueError("Encrypted asset is missing its owning account")
@@ -263,6 +270,7 @@ async def process_asset(asset_id: uuid.UUID) -> None:
             asset.processing_error = None
 
             try:
+                require_storage("derivatives", "staging")
                 with plaintext_asset_file(asset, user) as original:
                     if asset.mime_type.startswith("video/"):
                         metadata = await asyncio.to_thread(
@@ -281,6 +289,7 @@ async def process_asset(asset_id: uuid.UUID) -> None:
                             if user is None:
                                 raise ValueError("Encrypted asset is missing its owning account")
                             thumbnail_directory = settings.staging_path / str(asset.user_id)
+                            require_storage_path(thumbnail_directory)
                             thumbnail_directory.mkdir(parents=True, exist_ok=True)
                             thumbnail = (thumbnail_directory / f"{asset.id}.{uuid.uuid4().hex}.thumbnail.webp").resolve()
                         else:
@@ -425,6 +434,8 @@ async def scan_external_library(library_id: uuid.UUID) -> None:
             library.error = None
             await session.commit()
             try:
+                if configured_owner_email() is not None:
+                    require_host_owner(owner)
                 root = validated_external_path(library.path)
                 if not root.is_dir():
                     raise FileNotFoundError(f"External library is unavailable: {root}")
@@ -450,17 +461,17 @@ async def scan_external_library(library_id: uuid.UUID) -> None:
                         await session.rollback()
                         batch = []
                         return False
+                    if configured_owner_email() is not None:
+                        require_host_owner(owner)
+                    require_storage_path(root)
                     checksums = [item[1] for item in batch]
-                    existing = set(
-                        (
-                            await session.scalars(
-                                select(Asset.checksum).where(
-                                    Asset.user_id == library.user_id,
-                                    Asset.checksum.in_(checksums),
-                                )
-                            )
-                        ).all()
-                    )
+                    existing_assets = list((await session.scalars(select(Asset).where(
+                        Asset.user_id == library.user_id, Asset.checksum.in_(checksums),
+                    ))).all())
+                    existing = {asset.checksum for asset in existing_assets}
+                    # A prior scan may have committed metadata just before the
+                    # broker went away. A rescan must retry those pending jobs.
+                    retry_processing = [asset for asset in existing_assets if asset.processing_status in {"pending", "failed"} and asset.lifecycle_state == "active"]
                     created: list[Asset] = []
                     for path, checksum, size, mime_type, file_created_at, file_modified_at in batch:
                         if checksum in existing:
@@ -488,13 +499,15 @@ async def scan_external_library(library_id: uuid.UUID) -> None:
                         )
                         session.add(asset)
                         created.append(asset)
+                        existing.add(checksum)
                     await session.commit()
-                    for asset in created:
+                    for asset in [*created, *retry_processing]:
                         process_asset_task.delay(str(asset.id))
                     batch = []
                     return True
 
                 for path in paths:
+                    validated_external_path(str(path))
                     checksum = await asyncio.to_thread(sha256_file, path)
                     mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
                     stat = path.stat()
@@ -527,7 +540,11 @@ async def scan_external_library(library_id: uuid.UUID) -> None:
                 owner = await session.get(User, library.user_id) if library is not None else None
                 if library is not None and owner is not None and owner.disabled_at is None:
                     library.status = "failed"
-                    library.error = str(exc)[:2000]
+                    library.error = (
+                        "Reconnect the approved photo drive and retry the scan."
+                        if isinstance(exc, StorageUnavailableError)
+                        else "The photo scan could not finish. Check the drive and background service, then retry."
+                    )
                     await session.commit()
                 raise
     finally:
@@ -702,6 +719,8 @@ def _copy_verified_replica(
     timestamp: float | None,
 ) -> None:
     """Atomically publish one checksum-valid replica as the managed original."""
+    require_storage_path(source)
+    require_storage_path(destination)
     if not source.is_file():
         raise InvalidReplicaError("missing")
     try:
@@ -724,10 +743,12 @@ def _copy_verified_replica(
             raise InvalidReplicaError("disappeared") from exc
         if sha256_file(temporary) != expected_checksum:
             raise InvalidReplicaError("copy_checksum_mismatch")
+        require_storage_path(destination)
         os.replace(temporary, destination)
         if timestamp is not None:
             os.utime(destination, (timestamp, timestamp))
     finally:
+        require_storage_path(temporary)
         temporary.unlink(missing_ok=True)
 
 
@@ -829,6 +850,9 @@ async def restore_asset(asset_id: uuid.UUID) -> bool:
             await lock_storage_path(session, destination)
             timestamp_value = asset.file_modified_at or asset.file_created_at or asset.taken_at
             try:
+                # Check inside the durable failure boundary: a disconnected
+                # drive must not strand a previously queued asset forever.
+                require_storage("originals", "replicas")
                 selected_id, attempted_failures = await asyncio.to_thread(
                     restore_from_candidates,
                     candidates,
@@ -864,6 +888,7 @@ async def restore_asset(asset_id: uuid.UUID) -> bool:
                         "original_missing_recovery_available",
                         "original_unrecoverable",
                         "restore_write_failed",
+                        "storage_unavailable",
                     ]),
                 ))).all())
                 for event in open_events:
@@ -880,6 +905,15 @@ async def restore_asset(asset_id: uuid.UUID) -> bool:
                 metrics.operations.observe_recovery("asset_restore", "success")
                 metric_recorded = True
                 return True
+            except StorageUnavailableError:
+                asset.restore_status = "failed"
+                await _open_recovery_event(
+                    session, asset, kind="storage_unavailable", severity="warning",
+                    message="Recovery is paused. Reconnect the approved storage drive; monitoring will retry restoration.",
+                    detail={"operation": "restore"},
+                )
+                await session.commit()
+                raise
             except NoUsableReplicaError as exc:
                 failures.extend(exc.failures)
                 for failure in failures:
@@ -938,6 +972,53 @@ def restore_asset_task(asset_id: str) -> bool:
     return asyncio.run(restore_asset(uuid.UUID(asset_id)))
 
 
+def automatic_restore_retry_due(asset: Asset, event: MonitoringEvent | None, now: datetime) -> bool:
+    if event is None or asset.restore_status == "failed":
+        return True
+    raw_queued_at = (event.detail or {}).get("queued_at")
+    try:
+        queued_at = datetime.fromisoformat(str(raw_queued_at)) if raw_queued_at else event.created_at
+    except ValueError:
+        queued_at = event.created_at
+    if queued_at is None:
+        return True
+    if queued_at.tzinfo is None:
+        queued_at = queued_at.replace(tzinfo=timezone.utc)
+    # An event is not a permanent lock. A worker/broker crash may leave no
+    # callback; after 15 minutes, the idempotent, asset-locked restore can retry.
+    return now - queued_at >= timedelta(minutes=15)
+
+
+async def queue_automatic_restore(session: AsyncSession, asset: Asset) -> bool:
+    event = await session.scalar(select(MonitoringEvent).where(
+        MonitoringEvent.asset_id == asset.id,
+        MonitoringEvent.kind == "automatic_restore",
+        MonitoringEvent.status == "open",
+    ))
+    now = datetime.now(timezone.utc)
+    if not automatic_restore_retry_due(asset, event, now):
+        return False
+    if event is None:
+        event = MonitoringEvent(user_id=asset.user_id, asset_id=asset.id, kind="automatic_restore", severity="warning")
+        session.add(event)
+    event.message = "Original was missing; restore queued from verified protection copies."
+    event.detail = {"queued_at": now.isoformat()}
+    asset.restore_status = "queued"
+    # Commit before publishing so a fast worker cannot finish and then have
+    # the monitor overwrite its restored state with a stale queued value.
+    await session.commit()
+    try:
+        restore_asset_task.delay(str(asset.id))
+    except Exception:
+        asset.restore_status = "failed"
+        event.message = "Recovery could not be queued. Monitoring will retry after the background service is available."
+        await session.commit()
+        metrics.operations.observe_recovery("asset_restore", "failed")
+        return False
+    metrics.operations.observe_recovery("asset_restore", "queued")
+    return True
+
+
 async def monitor_storage(user_id: uuid.UUID | None = None, *, repair: bool = True) -> None:
     """Verify originals and protection copies and queue safe, automatic recovery."""
     engine = create_async_engine(settings.database_url, poolclass=NullPool)
@@ -952,10 +1033,31 @@ async def monitor_storage(user_id: uuid.UUID | None = None, *, repair: bool = Tr
             assets = (await session.scalars(asset_statement)).all()
             for asset in assets:
                 original = Path(asset.original_path)
+                try:
+                    require_storage_path(original)
+                    require_storage("replicas")
+                except StorageUnavailableError:
+                    await _open_recovery_event(
+                        session, asset, kind="storage_unavailable", severity="warning",
+                        message="Reconnect the approved storage drive. Verification and recovery are paused until its identity is confirmed.",
+                        detail={},
+                    )
+                    results["replica_degraded"] += 1
+                    continue
                 replicas = list((await session.scalars(
                     select(AssetReplica).where(AssetReplica.asset_id == asset.id)
                 )).all())
-                original_ok = original.is_file() and await asyncio.to_thread(sha256_file, original) == asset.storage_checksum
+                try:
+                    original_ok = original.is_file() and await asyncio.to_thread(sha256_file, original) == asset.storage_checksum
+                except OSError:
+                    # A disconnect during hashing is retried on the next monitor
+                    # pass; it must not abort verification of every other file.
+                    await _open_recovery_event(
+                        session, asset, kind="storage_unavailable", severity="warning",
+                        message="The original could not be read. Reconnect the approved drive and retry verification.",
+                        detail={},
+                    )
+                    continue
                 healthy_replicas = []
                 for replica in replicas:
                     try:
@@ -986,26 +1088,7 @@ async def monitor_storage(user_id: uuid.UUID | None = None, *, repair: bool = Tr
                     results["unrecoverable"] += 1
                 if not original_ok and healthy_replicas and asset.storage_source == "managed":
                     if repair:
-                        already_open = await session.scalar(select(MonitoringEvent).where(
-                            MonitoringEvent.asset_id == asset.id,
-                            MonitoringEvent.kind == "automatic_restore",
-                            MonitoringEvent.status == "open",
-                        ))
-                        if already_open is None:
-                            session.add(MonitoringEvent(
-                                user_id=asset.user_id, asset_id=asset.id, kind="automatic_restore",
-                                severity="warning", message="Original was missing; restore queued from verified protection copies.",
-                            ))
-                            await notify_user_devices(
-                                session,
-                                asset.user_id,
-                                title="Storage recovery started",
-                                body="Drivebound is restoring a missing original from a verified protection copy.",
-                                data={"kind": "storage_warning", "asset_id": str(asset.id)},
-                            )
-                            asset.restore_status = "queued"
-                            restore_asset_task.delay(str(asset.id))
-                            metrics.operations.observe_recovery("asset_restore", "queued")
+                        await queue_automatic_restore(session, asset)
                     else:
                         await _open_recovery_event(
                             session,
@@ -1035,7 +1118,8 @@ async def monitor_storage(user_id: uuid.UUID | None = None, *, repair: bool = Tr
                         MonitoringEvent.status == "open",
                         MonitoringEvent.kind.in_([
                             "automatic_restore",
-                            "original_missing_recovery_available",
+                        "original_missing_recovery_available",
+                        "storage_unavailable",
                             "original_unrecoverable",
                             "restore_write_failed",
                             "replica_verification_failed",
@@ -1223,12 +1307,33 @@ async def backup_operational_state() -> None:
         await engine.dispose()
 
 
-@celery_app.task(name="backup_operational_state")
-def backup_operational_state_task() -> None:
-    asyncio.run(backup_operational_state())
+@celery_app.task(name="backup_operational_state", soft_time_limit=6300, time_limit=6600)
+def backup_operational_state_task(request_token: str | None = None) -> None:
+    from redis import Redis
+    from app.services.readiness import BACKUP_LOCK_SECONDS, backup_lock_key
+
+    token = request_token or uuid.uuid4().hex
+    key = backup_lock_key()
+    with Redis.from_url(settings.redis_url, socket_timeout=2, socket_connect_timeout=2) as client:
+        if request_token:
+            running_token = uuid.uuid4().hex
+            claimed = client.eval(
+                "if redis.call('get',KEYS[1]) == ARGV[1] then redis.call('set',KEYS[1],ARGV[2],'EX',ARGV[3]); return 1 else return 0 end",
+                1, key, token, running_token, BACKUP_LOCK_SECONDS,
+            )
+            if not claimed:
+                return  # Expired/replaced or duplicate delivery must not overlap.
+            token = running_token
+        elif not client.set(key, token, nx=True, ex=BACKUP_LOCK_SECONDS):
+            return
+        try:
+            asyncio.run(backup_operational_state())
+        finally:
+            client.eval("if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end", 1, key, token)
 
 
 async def migrate_legacy_media(limit: int = 10) -> int:
+    require_storage("originals", "derivatives", "staging", "replicas")
     """Move a bounded batch of legacy managed media into per-user encryption.
 
     This is deliberately opt-in through ``MEDIA_ENCRYPTION_MIGRATE_LEGACY``.

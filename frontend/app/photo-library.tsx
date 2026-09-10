@@ -8,7 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { DriveboundUser } from "./auth-gate";
+import type { DriveboundUser, HostSetup } from "./auth-gate";
 import { API_URL, apiRequest } from "./api-client";
 import { LibraryScreen, type LibraryView } from "./library-screens";
 type TimelineAsset = {
@@ -773,7 +773,7 @@ function StoragePanel({ onClose, onLibraryChanged }: { onClose: () => void; onLi
   const [libraries, setLibraries] = useState<ExternalLibrary[]>([]);
   const [protection, setProtection] = useState<ProtectionStatus | null>(null);
   const [name, setName] = useState("Imported drive");
-  const [path, setPath] = useState("/data/imports");
+  const [hostSetup, setHostSetup] = useState<HostSetup | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [monitoring, setMonitoring] = useState<MonitoringOverview | null>(null);
@@ -796,7 +796,7 @@ function StoragePanel({ onClose, onLibraryChanged }: { onClose: () => void; onLi
 
   const refresh = useCallback(async () => {
     try {
-      const [storageResponse, libraryResponse, protectionResponse, monitoringResponse, nodesResponse, policyResponse, drivesResponse, backupsResponse, devicesResponse, syncRootsResponse] = await Promise.all([
+      const [storageResponse, libraryResponse, protectionResponse, monitoringResponse, nodesResponse, policyResponse, drivesResponse, backupsResponse, devicesResponse, syncRootsResponse, setupResponse] = await Promise.all([
         apiFetch(`/api/v1/storage`),
         apiFetch(`/api/v1/libraries`),
         apiFetch(`/api/v1/assets/protection/status`),
@@ -807,6 +807,7 @@ function StoragePanel({ onClose, onLibraryChanged }: { onClose: () => void; onLi
         apiFetch(`/api/v1/storage/backups`),
         apiFetch(`/api/v1/devices`),
         apiFetch(`/api/v1/sync/roots`),
+        apiFetch(`/api/v1/libraries/setup`),
       ]);
       if (storageResponse.ok) setStorage(await storageResponse.json());
       if (libraryResponse.ok) setLibraries(await libraryResponse.json());
@@ -816,6 +817,8 @@ function StoragePanel({ onClose, onLibraryChanged }: { onClose: () => void; onLi
       if (policyResponse.ok) setPolicy(await policyResponse.json());
       if (drivesResponse.ok) setReplicaDrives(await drivesResponse.json());
       if (backupsResponse.ok) setBackupArchives(await backupsResponse.json());
+      if (setupResponse.ok) setHostSetup(await setupResponse.json());
+      else setHostSetup(null);
       if (devicesResponse.ok) setBackupDevices(await devicesResponse.json());
       if (syncRootsResponse.ok) {
         const roots: SyncRoot[] = await syncRootsResponse.json();
@@ -849,14 +852,19 @@ function StoragePanel({ onClose, onLibraryChanged }: { onClose: () => void; onLi
     setSaving(true);
     setMessage(null);
     try {
-      const response = await apiFetch(`/api/v1/libraries`, {
+      const response = await apiFetch(`/api/v1/libraries/connect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, path }),
+        body: JSON.stringify({ name: name.trim() }),
       });
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail ?? "Could not add library");
-      await apiFetch(`/api/v1/libraries/${body.id}/scan`, { method: "POST" });
+      const scanResponse = await apiFetch(`/api/v1/libraries/${body.id}/scan`, { method: "POST" });
+      const scanBody = await scanResponse.json().catch(() => null);
+      if (!scanResponse.ok || scanBody?.status === "failed") {
+        await refresh();
+        throw new Error("Folder connected, but the import could not start. Check that the drive and background worker are available, then select Scan to retry.");
+      }
       setMessage("Library added. Drivebound is indexing it in the background.");
       await refresh();
       onLibraryChanged();
@@ -872,13 +880,30 @@ function StoragePanel({ onClose, onLibraryChanged }: { onClose: () => void; onLi
     setMessage(null);
     try {
       const response = await apiFetch(`/api/v1/libraries/${library.id}/scan`, { method: "POST" });
-      setMessage(response.ok ? `${library.name} is queued for scanning.` : `${library.name} could not be scanned.`);
-      if (response.ok) { await refresh(); onLibraryChanged(); }
+      const result = await response.json().catch(() => null);
+      const queued = response.ok && result?.status !== "failed";
+      setMessage(queued ? `${library.name} is queued for scanning.` : `${library.name} could not be scanned. Check the PC and selected drive, then retry.`);
+      await refresh();
+      if (queued) onLibraryChanged();
     } catch {
       setMessage(`${library.name} could not be scanned.`);
     } finally {
       setActionBusy(null);
     }
+  };
+
+  const startOperationalBackup = async () => {
+    setActionBusy("operational-backup");
+    setMessage(null);
+    try {
+      const response = await apiFetch("/api/v1/storage/backups/run", { method: "POST" });
+      const result = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(typeof result?.detail === "string" ? result.detail : "The backup could not be queued. Check the PC and backup drive, then retry.");
+      setMessage("Database and configuration backup queued. Keep the PC and backup drive connected. The archive list updates as verification finishes.");
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "The backup could not be queued. Please retry.");
+    } finally { setActionBusy(null); }
   };
 
   const protectAll = async () => {
@@ -1090,9 +1115,10 @@ function StoragePanel({ onClose, onLibraryChanged }: { onClose: () => void; onLi
 
         <section className="storage-section">
           <div className="section-title"><h3>Operational backups</h3><span>{backupArchives.length}</span></div>
+          {hostSetup?.can_connect && <button className="secondary-button" onClick={() => void startOperationalBackup()} disabled={actionBusy != null}>{actionBusy === "operational-backup" ? "Queueing backup…" : "Back up and verify now"}</button>}
           {backupArchives.slice(0, 5).map((backup) => <article className="library-card" key={backup.id}><div><strong>{humanize(backup.kind)} backup</strong><span>{humanize(backup.verification_status)} · {formatBytes(backup.size_bytes)}</span><small>{backup.verified_at ? `Verified ${formatDate(backup.verified_at)}` : backup.verification_detail ?? `Created ${formatDate(backup.created_at)}`}</small></div><span className={`backup-state ${backup.verification_status === "verified" ? "complete" : "waiting"}`}>{backup.status}</span></article>)}
           {backupArchives.length === 0 && <p className="health-note">No operational backup archive has been recorded yet.</p>}
-          <p className="health-note">Configuration changes are deduplicated; database archives are logically checked before they count as recoverable.</p>
+          <p className="health-note">Verification checks archive structure and checksums; it does not prove a full disaster recovery. Keep the PC&apos;s private setup files, encryption keys and account-deletion ledger with your recovery set. These archives intentionally exclude secrets.</p>
         </section>
 
         <section className="storage-section"><div className="section-title"><h3>Paired storage nodes</h3><span>{nodes.length}</span></div>{nodes.map(node => <article className="library-card" key={node.id}><div><strong>{node.name}</strong><span>{node.status}</span><small>{node.last_seen_at ? `Last seen ${new Date(node.last_seen_at).toLocaleString()}` : "Waiting for first heartbeat"}</small></div></article>)}<div className="library-form"><button onClick={() => void createPairingCode()} disabled={actionBusy != null}>{actionBusy === "pair" ? "Creating code…" : "Pair another drive"}</button>{pairingCode && <p role="status">Enter code <code>{pairingCode}</code> on the storage node within 10 minutes.</p>}</div></section>
@@ -1107,10 +1133,13 @@ function StoragePanel({ onClose, onLibraryChanged }: { onClose: () => void; onLi
             </article>
           ))}
           <div className="library-form">
-            <label>Name<input value={name} onChange={(event) => setName(event.target.value)} /></label>
-            <label>Container path<input value={path} onChange={(event) => setPath(event.target.value)} spellCheck={false} /><small>Use a path mounted inside the Drivebound server or container.</small></label>
-            <button onClick={() => void addLibrary()} disabled={saving || actionBusy != null || !name.trim() || !path.trim()}>{saving ? "Adding…" : "Add and scan"}</button>
-            <p>Place existing media in <code>data/imports</code>, or mount another read-only folder at <code>/data/imports</code>.</p>
+            <p>{hostSetup?.message ?? "Checking the folder approved in Windows Setup…"}</p>
+            {hostSetup?.can_connect && !hostSetup.library && <>
+              <label>Name<input value={name} onChange={(event) => setName(event.target.value)} maxLength={255} /></label>
+              <p>Selected folder: {hostSetup.folder_name ?? "Your photo folder"}</p>
+              <button onClick={() => void addLibrary()} disabled={saving || actionBusy != null || !name.trim() || !hostSetup.storage_available}>{saving ? "Adding…" : "Connect selected folder and scan"}</button>
+            </>}
+            <p>Drivebound never changes the originals in an imported folder. To review the selected folder or its approved owner, open Drivebound Setup on the PC.</p>
           </div>
         </section>
       </aside>

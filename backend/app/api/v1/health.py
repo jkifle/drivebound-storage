@@ -6,6 +6,8 @@ from sqlalchemy import text
 
 from app.core.config import settings
 from app.db.session import engine
+from app.services.host_storage import storage_readiness
+from app.services.readiness import background_readiness
 
 router = APIRouter(tags=["health"])
 
@@ -46,3 +48,25 @@ async def health(response: Response) -> dict[str, object]:
             "redis": "ok" if redis_ok else "unavailable",
         },
     }
+
+
+@router.get("/ready")
+async def ready(response: Response) -> dict[str, object]:
+    """Aggregate service readiness, separate from dependency startup health.
+
+    This intentionally discloses only bounded status categories. The desktop
+    launcher checks frontend HTTP readiness separately, outside this API.
+    """
+    postgres_ok, redis_ok, background, storage = await asyncio.gather(
+        check_postgres(), check_redis(), background_readiness(),
+        asyncio.to_thread(storage_readiness),
+    )
+    services = {"postgres": "ok" if postgres_ok else "unavailable",
+                "redis": "ok" if redis_ok else "unavailable", **background}
+    healthy = all(value == "ok" for value in services.values()) and all(
+        value in {"ok", "not_configured"} for value in storage.values()
+    )
+    if not healthy:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    response.headers["Cache-Control"] = "no-store"
+    return {"status": "ready" if healthy else "not_ready", "services": services, "storage": storage}

@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,7 +28,10 @@ from app.schemas.lifecycle import (
 )
 from app.services.lifecycle import storage_policy
 from app.services.storage import validated_replica_drive_path
-from app.worker.tasks import rebalance_user_storage_task
+from app.services.host_storage import StorageUnavailableError, is_host_owner, require_host_owner, require_storage, require_storage_path
+from app.services.readiness import BACKUP_LOCK_SECONDS, backup_lock_key
+from app.services.operational_backups import archive_evidence_current
+from app.worker.tasks import backup_operational_state_task, rebalance_user_storage_task
 
 router = APIRouter(prefix="/storage", tags=["storage"])
 
@@ -53,6 +57,9 @@ def archive_response(archive: BackupArchive) -> BackupArchiveResponse:
 def inspect_root(name: str, path: Path, role: str) -> dict[str, object]:
     resolved = path.resolve()
     try:
+        require_storage_path(resolved)
+        if not resolved.is_dir():
+            raise OSError("Storage folder is unavailable")
         usage = shutil.disk_usage(resolved)
         writable = os.access(resolved, os.W_OK)
         return {
@@ -67,7 +74,7 @@ def inspect_root(name: str, path: Path, role: str) -> dict[str, object]:
             "free_bytes": usage.free,
             "used_percent": round((usage.used / usage.total) * 100, 1) if usage.total else 0,
         }
-    except OSError as exc:
+    except (OSError, StorageUnavailableError):
         return {
             "name": name,
             "path": str(resolved),
@@ -75,7 +82,7 @@ def inspect_root(name: str, path: Path, role: str) -> dict[str, object]:
             "status": "unavailable",
             "smart_status": "unavailable",
             "writable": False,
-            "error": str(exc),
+            "error": "Reconnect the approved storage drive and retry.",
         }
 
 
@@ -88,7 +95,8 @@ async def storage_status(
         ("Managed originals", settings.originals_path, "managed"),
         ("Protection copies", settings.replica_path, "replica"),
     ]
-    roots.extend((f"External library {index + 1}", root, "external") for index, root in enumerate(settings.external_root_list))
+    if is_host_owner(user):
+        roots.extend((f"External library {index + 1}", root, "external") for index, root in enumerate(settings.external_root_list))
     configured = list((await session.scalars(
         select(StorageDrive).where(StorageDrive.user_id == user.id).order_by(StorageDrive.priority.desc(), StorageDrive.name)
     )).all())
@@ -96,7 +104,7 @@ async def storage_status(
     drives = await asyncio.gather(*(asyncio.to_thread(inspect_root, name, path, role) for name, path, role in roots))
     online = [drive for drive in drives if drive["status"] == "online"]
     return {
-        "status": "ok" if online else "unavailable",
+        "status": "ok" if len(online) == len(drives) else ("degraded" if online else "unavailable"),
         "drives": drives,
         "smart_available": False,
         "health_note": "Filesystem availability is monitored. SMART requires an optional host-level adapter.",
@@ -201,6 +209,33 @@ async def backup_status(
     return [archive_response(archive) for archive in archives]
 
 
+@router.post("/backups/run", status_code=status.HTTP_202_ACCEPTED)
+async def run_operational_backup(user: User = Depends(current_user)) -> dict[str, str]:
+    """The approved host owner can initiate the first recovery archive visibly."""
+    require_host_owner(user)
+    require_storage("backups")
+    if not settings.database_backup_enabled:
+        raise HTTPException(409, "Database backups are disabled by the host operator.")
+    token = uuid.uuid4().hex
+    key = backup_lock_key()
+    client = Redis.from_url(settings.redis_url, socket_timeout=2, socket_connect_timeout=2)
+    try:
+        if not await client.set(key, token, nx=True, ex=BACKUP_LOCK_SECONDS):
+            raise HTTPException(409, "A database backup is already queued or running. Check the archive list for its result.")
+        try:
+            job = await asyncio.to_thread(backup_operational_state_task.apply_async, args=[token], retry=False)
+        except Exception:
+            await client.eval("if redis.call('get',KEYS[1]) == ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end", 1, key, token)
+            raise HTTPException(503, "The backup could not be queued. Check the background service and retry.") from None
+        return {"status": "queued", "job_id": str(job.id)}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(503, "The backup service is unavailable. Retry after the PC is ready.") from None
+    finally:
+        await client.aclose()
+
+
 @router.get("/recovery", response_model=RecoveryReadinessResponse)
 async def recovery_readiness(
     session: AsyncSession = Depends(get_db), user: User = Depends(current_user)
@@ -240,11 +275,16 @@ async def recovery_readiness(
         hours=max(settings.database_backup_interval_hours * 2, 1)
     )
     database_fresh = bool(recoverable_database and recoverable_database.created_at >= freshness_cutoff)
+    database_evidence, configuration_evidence = await asyncio.gather(
+        archive_evidence_current(recoverable_database),
+        archive_evidence_current(recoverable_configuration),
+    )
     database_ready = bool(
         recoverable_database
         and database_fresh
+        and database_evidence
     )
-    configuration_ready = recoverable_configuration is not None
+    configuration_ready = configuration_evidence
     return RecoveryReadinessResponse(
         database_backup_enabled=settings.database_backup_enabled,
         recoverable=settings.database_backup_enabled and database_ready and configuration_ready,
@@ -252,10 +292,12 @@ async def recovery_readiness(
         database_backup_status=(
             "disabled" if not settings.database_backup_enabled else
             "verified" if database_ready else
+            "failed" if recoverable_database and not database_evidence else
             "stale" if recoverable_database and not database_fresh else
             latest_database.verification_status if latest_database else "missing"
         ),
         configuration_backup_status="verified" if configuration_ready else (
+            "failed" if recoverable_configuration else
             latest_configuration.verification_status if latest_configuration else "missing"
         ),
         latest_database_backup_at=recoverable_database.created_at if recoverable_database else None,

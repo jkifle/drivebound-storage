@@ -19,6 +19,7 @@ from app.models.replica import AssetReplica
 from app.models.storage_policy import StorageDrive
 from app.services.lifecycle import storage_policy
 from app.services.lifecycle import safely_unlink_catalog_path
+from app.services.host_storage import require_storage, require_storage_path
 from app.services.storage import (
     canonical_storage_path,
     lock_storage_path,
@@ -59,6 +60,7 @@ def disk_score(target: ReplicaTarget) -> tuple[int, int, str]:
 
 
 async def replica_targets(session: AsyncSession, user_id: uuid.UUID) -> list[ReplicaTarget]:
+    require_storage("replicas")
     drives = list((await session.scalars(
         select(StorageDrive).where(StorageDrive.user_id == user_id, StorageDrive.eligible.is_(True))
     )).all())
@@ -86,6 +88,7 @@ async def replica_targets(session: AsyncSession, user_id: uuid.UUID) -> list[Rep
 
 
 def _write_replica_metadata(asset: Asset, destination: Path) -> Path:
+    require_storage_path(destination)
     # Content bytes are checksum-addressed and can be shared by immutable
     # revisions. Each revision keeps its own recovery sidecar.
     metadata_path = destination.with_name(f"{destination.name}.{asset.id}.metadata.json")
@@ -113,6 +116,8 @@ def _write_replica_metadata(asset: Asset, destination: Path) -> Path:
 
 
 def _copy_verified(source: Path, destination: Path, expected_checksum: str) -> tuple[str, Path]:
+    require_storage_path(source)
+    require_storage_path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists() and sha256_file(destination) != expected_checksum:
         destination.unlink()

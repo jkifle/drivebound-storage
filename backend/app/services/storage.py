@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.services.encryption import decrypt_file, encrypt_file
+from app.services.host_storage import require_storage_path
 
 
 def storage_path_lock_key(path: Path | str) -> int:
@@ -55,6 +56,7 @@ def derivative_path_for(kind: str, checksum: str, user_id: uuid.UUID) -> Path:
 
 async def stage_upload(upload: UploadFile, user_id: uuid.UUID | None = None) -> tuple[Path, str, int]:
     staging_directory = settings.staging_path / str(user_id) if user_id is not None else settings.staging_path
+    require_storage_path(staging_directory)
     staging_directory.mkdir(parents=True, exist_ok=True)
     temporary_path = staging_directory / f"{uuid.uuid4()}.upload"
     digest = hashlib.sha256()
@@ -63,6 +65,7 @@ async def stage_upload(upload: UploadFile, user_id: uuid.UUID | None = None) -> 
     try:
         async with aiofiles.open(temporary_path, "xb") as output:
             while chunk := await upload.read(settings.upload_chunk_size):
+                require_storage_path(staging_directory)
                 size += len(chunk)
                 if size > settings.max_upload_size:
                     raise HTTPException(
@@ -85,6 +88,8 @@ async def stage_upload(upload: UploadFile, user_id: uuid.UUID | None = None) -> 
 
 def commit_original(staged_path: Path, final_path: Path) -> bool:
     """Create an original exactly once; never overwrite an existing path."""
+    require_storage_path(staged_path)
+    require_storage_path(final_path)
     final_path.parent.mkdir(parents=True, exist_ok=True)
     created = False
     try:
@@ -101,28 +106,36 @@ def commit_original(staged_path: Path, final_path: Path) -> bool:
             final_path.unlink(missing_ok=True)
         raise
     finally:
+        require_storage_path(staged_path)
         staged_path.unlink(missing_ok=True)
     return created
 
 
 def commit_encrypted_original(staged_path: Path, final_path: Path, key: bytes) -> bool:
-    """Encrypt a completed upload while publishing it exactly once."""
+    """Publish exactly once, retaining the upload until publication succeeds."""
+    require_storage_path(staged_path)
+    require_storage_path(final_path)
     try:
         encrypt_file(staged_path, final_path, key)
-        return True
     except FileExistsError:
+        # Ingestion authenticates an existing ciphertext before adopting it.
+        # Keep the source until that check succeeds as well.
         return False
-    finally:
-        staged_path.unlink(missing_ok=True)
+    require_storage_path(staged_path)
+    staged_path.unlink(missing_ok=True)
+    return True
 
 
 def commit_encrypted_derivative(staged_path: Path, final_path: Path, key: bytes) -> bool:
+    require_storage_path(staged_path)
+    require_storage_path(final_path)
     try:
         encrypt_file(staged_path, final_path, key)
         return True
     except FileExistsError:
         return False
     finally:
+        require_storage_path(staged_path)
         staged_path.unlink(missing_ok=True)
 
 
@@ -135,6 +148,8 @@ def decrypted_temporary_file(
 ) -> Iterator[Path]:
     """Expose authenticated plaintext only for the duration of a worker task."""
     staging_directory = settings.staging_path / str(user_id) if user_id is not None else settings.staging_path
+    require_storage_path(source)
+    require_storage_path(staging_directory)
     staging_directory.mkdir(parents=True, exist_ok=True)
     descriptor, raw_path = tempfile.mkstemp(prefix="decrypt-", suffix=suffix, dir=staging_directory)
     os.close(descriptor)
@@ -144,6 +159,7 @@ def decrypted_temporary_file(
         decrypt_file(source, destination, key)
         yield destination
     finally:
+        require_storage_path(destination)
         destination.unlink(missing_ok=True)
 
 
@@ -152,6 +168,7 @@ def validated_storage_path(stored_path: str, root: Path) -> Path:
     resolved_root = root.resolve()
     if not path.is_relative_to(resolved_root):
         raise HTTPException(status_code=500, detail="Asset has an invalid storage path")
+    require_storage_path(path)
     return path
 
 
@@ -159,6 +176,7 @@ def validated_external_path(stored_path: str) -> Path:
     path = Path(stored_path).resolve()
     if not any(path.is_relative_to(root) for root in settings.external_root_list):
         raise HTTPException(status_code=400, detail="Path is outside the configured external library roots")
+    require_storage_path(path)
     return path
 
 
@@ -167,6 +185,7 @@ def validated_replica_drive_path(stored_path: str) -> Path:
     path = Path(stored_path).resolve()
     if not any(path.is_relative_to(root) for root in settings.replica_root_list):
         raise HTTPException(status_code=400, detail="Path is outside the configured replica-drive roots")
+    require_storage_path(path)
     return path
 
 
@@ -175,6 +194,7 @@ def validated_backup_path(stored_path: str) -> Path:
     root = settings.backups_path.resolve()
     if not path.is_relative_to(root):
         raise HTTPException(status_code=500, detail="Backup path is outside the configured backup root")
+    require_storage_path(path)
     return path
 
 

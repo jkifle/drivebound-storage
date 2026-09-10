@@ -14,11 +14,19 @@ Future use requires only **Drivebound Start** and **Drivebound Stop**. Stopping
 the application never deletes photos or accounts. Running setup again preserves
 the existing encryption key and account data.
 
+Setup now remembers the approved account and disk identities, safely resumes
+interrupted configuration, and offers startup after Windows sign-in. Use
+**Drivebound Status** for redacted readiness checks and **Drivebound Remote Access**
+to configure private Tailscale HTTPS and verification email without editing secrets.
+Reboot, real-drive interruption and cellular acceptance remain required pilot checks.
+
 See the [guided Windows setup](docs/operations/windows-setup.md) for the complete
 storage and recovery explanation.
 
 For command-line or non-Windows development, copy `.env.example` to `.env`,
 replace every placeholder secret, and run `docker compose up --build -d`.
+Set `HOST_OWNER_EMAIL` to the verified account permitted to connect host import
+folders; new registrations cannot claim mounted folders without host approval.
 
 The backend applies Alembic migrations through `0017` before starting. Confirm the current migration with:
 
@@ -61,7 +69,10 @@ New accounts complete three steps:
 2. Connect a read-only media folder or defer it.
 3. Review protection-drive guidance and open the library.
 
-The default import folder is `data/imports`, exposed inside the containers as `/data/imports`. Scanning creates database metadata and derivatives but never moves, renames, or deletes source files.
+Windows onboarding confirms the folder selected in Setup; no container path is
+required. Manual deployments default to `data/imports` (`/data/imports` inside
+containers). Scanning creates metadata and derivatives but never moves, renames,
+or deletes source files. Import failures remain visible and retryable.
 
 ## Storage safety
 
@@ -86,6 +97,10 @@ For real drive-failure protection, mount `/data/replicas` from a second physical
 Files use immutable revisions. Moving an item to **Trash** records an audit event and a `purge_after` date; restore is available throughout the configured retention period. Rollback makes a previous revision active without overwriting it. The scheduled purge removes Drivebound-managed originals, derivatives, and replicas only after retention has expired and no other revision references those bytes. External libraries remain read-only and are never deleted by Drivebound.
 
 The scheduler writes deduplicated configuration snapshots and periodic logical PostgreSQL archives under `BACKUPS_PATH`. Each database archive is checked with `pg_restore --list` before it counts as verified. Archives older than `DATABASE_BACKUP_RETENTION_DAYS` are pruned. Review their verification state in **Storage**.
+
+The approved host owner can select **Back up and verify now** in Storage to
+initiate the first archive immediately. Archive verification does not replace
+an isolated full restore; retain the separate secret and deletion-ledger recovery set.
 
 `GET /api/v1/storage/recovery` provides an authenticated readiness summary without exposing host paths, checksums, or secrets. Account-scoped `POST /api/v1/monitoring/verify` performs a non-destructive checksum scan; `POST /api/v1/monitoring/run` also permits safe repair from verified copies. Follow the [recovery drill runbook](docs/operations/recovery-drill.md) for isolated PostgreSQL and media restore testing.
 

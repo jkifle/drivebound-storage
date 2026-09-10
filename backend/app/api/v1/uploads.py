@@ -19,6 +19,7 @@ from app.models.user import User
 from app.schemas.asset import AssetResponse
 from app.schemas.upload import UploadSessionCreate, UploadSessionResponse
 from app.services.ingestion import persist_managed_asset
+from app.services.host_storage import require_storage_path, require_storage
 from app.services.storage import canonical_storage_path, sha256_file
 from app.worker.tasks import process_asset_task
 
@@ -72,6 +73,7 @@ async def create_upload(
     session: AsyncSession = Depends(get_db),
     principal: UploadPrincipal = Depends(upload_principal),
 ) -> UploadSessionResponse:
+    require_storage("originals", "staging")
     if payload.total_size > settings.max_upload_size:
         raise HTTPException(status_code=413, detail="Upload exceeds the configured size limit")
     owner = await session.scalar(
@@ -184,6 +186,7 @@ async def append_upload(
         raise HTTPException(status_code=409, detail="Upload offset does not match", headers={"Upload-Offset": str(upload.offset)})
 
     staging_path = Path(upload.staging_path)
+    require_storage_path(staging_path)
     if not staging_path.is_file():
         raise HTTPException(status_code=410, detail="Staged upload is unavailable")
     written = 0
@@ -191,6 +194,7 @@ async def append_upload(
         async with aiofiles.open(staging_path, "r+b") as output:
             await output.seek(upload.offset)
             async for chunk in request.stream():
+                require_storage_path(staging_path)
                 if upload.offset + written + len(chunk) > upload.total_size:
                     raise HTTPException(status_code=413, detail="Chunk exceeds declared upload size")
                 await output.write(chunk)
@@ -207,6 +211,7 @@ async def append_upload(
     if upload.expected_checksum and checksum != upload.expected_checksum:
         upload.status = "failed"
         await session.commit()
+        require_storage_path(staging_path)
         staging_path.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail="Completed upload checksum does not match")
 

@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.core.observability import metrics
 from app.models.storage_policy import BackupArchive
+from app.services.host_storage import require_storage
 from app.services.storage import sha256_file, validated_backup_path
 
 
@@ -54,6 +56,7 @@ def _same_configuration_snapshot(path: Path) -> bool:
 
 
 async def create_configuration_backup(session: AsyncSession) -> BackupArchive:
+    require_storage("backups")
     settings.backups_path.mkdir(parents=True, exist_ok=True)
     latest = await session.scalar(
         select(BackupArchive).where(BackupArchive.kind == "configuration").order_by(BackupArchive.created_at.desc()).limit(1)
@@ -135,6 +138,7 @@ def _create_database_dump(destination: Path) -> None:
 
 
 async def create_database_backup(session: AsyncSession, *, force: bool = False) -> BackupArchive | None:
+    require_storage("backups")
     if not settings.database_backup_enabled:
         metrics.operations.observe_backup("database", "skipped")
         return None
@@ -148,13 +152,12 @@ async def create_database_backup(session: AsyncSession, *, force: bool = False) 
         and latest.verification_status in {"pending", "verified"}
         and latest.created_at + timedelta(hours=settings.database_backup_interval_hours) > datetime.now(timezone.utc)
     ):
-        metrics.operations.observe_backup("database", "reused")
-        if latest.verification_status == "verified":
-            verified_at = latest.verified_at or latest.created_at
-            if verified_at is not None:
-                normalized = verified_at if verified_at.tzinfo else verified_at.replace(tzinfo=timezone.utc)
-                metrics.operations.set_backup_last_verified("database", normalized.timestamp())
-        return latest
+        # A recent catalog row is not proof that its archive survived. Reuse
+        # only bytes that still match and whose logical archive can be read.
+        if await revalidate_archive(latest):
+            metrics.operations.observe_backup("database", "reused")
+            metrics.operations.set_backup_last_verified("database", latest.verified_at.timestamp())
+            return latest
     settings.backups_path.mkdir(parents=True, exist_ok=True)
     destination = settings.backups_path / f"database-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}.dump"
     try:
@@ -193,38 +196,72 @@ def _verify_configuration_snapshot(path: Path) -> str:
     return "Checksum-verified, secret-free configuration snapshot."
 
 
+def check_archive_bytes(archive: BackupArchive) -> Path:
+    """Require the approved bytes to remain unchanged throughout the read."""
+    path = validated_backup_path(archive.path)
+    before = path.stat()
+    if not path.is_file() or before.st_size != archive.size_bytes or sha256_file(path) != archive.checksum:
+        raise ValueError("Archive checksum or size does not match")
+    after = path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+    ):
+        raise ValueError("Archive changed during verification")
+    # A remount during a long read must not be credited as verified evidence.
+    validated_backup_path(archive.path)
+    return path
+
+
+async def archive_evidence_current(archive: BackupArchive | None) -> bool:
+    """Read-only readiness check; a previous verification cannot hide byte loss."""
+    if archive is None or archive.status != "created" or archive.verification_status != "verified":
+        return False
+    try:
+        await asyncio.to_thread(check_archive_bytes, archive)
+        return True
+    except (OSError, ValueError, HTTPException):
+        return False
+
+
+async def revalidate_archive(archive: BackupArchive) -> bool:
+    try:
+        path = await asyncio.to_thread(check_archive_bytes, archive)
+        if archive.kind == "database":
+            detail = await asyncio.to_thread(_verify_database_dump, path)
+        elif archive.kind == "configuration":
+            detail = await asyncio.to_thread(_verify_configuration_snapshot, path)
+        else:
+            raise ValueError("Unsupported backup archive kind")
+        # Structural verification can take time; ensure it did not consume a
+        # different file from the one whose checksum was approved.
+        await asyncio.to_thread(check_archive_bytes, archive)
+        archive.verification_status = "verified"
+        archive.verified_at = datetime.now(timezone.utc)
+        archive.verification_detail = detail
+        metrics.operations.observe_backup(archive.kind, "verified")
+        return True
+    except Exception as exc:
+        archive.verification_status = "failed"
+        archive.verification_detail = str(exc)[:2000]
+        metrics.operations.observe_backup(archive.kind, "failed")
+        return False
+
+
 async def verify_operational_backups(session: AsyncSession, archive_id: uuid.UUID | None = None) -> int:
-    statement = select(BackupArchive).where(
-        BackupArchive.status == "created", BackupArchive.verification_status != "verified"
-    )
+    require_storage("backups")
+    statement = select(BackupArchive).where(BackupArchive.status == "created")
     if archive_id is not None:
         statement = statement.where(BackupArchive.id == archive_id)
     archives = list((await session.scalars(statement)).all())
     verified = 0
     for archive in archives:
-        try:
-            path = validated_backup_path(archive.path)
-            if not path.is_file() or await asyncio.to_thread(sha256_file, path) != archive.checksum:
-                raise ValueError("Archive checksum does not match")
-            if archive.kind == "database":
-                detail = await asyncio.to_thread(_verify_database_dump, path)
-            elif archive.kind == "configuration":
-                detail = await asyncio.to_thread(_verify_configuration_snapshot, path)
-            else:
-                raise ValueError("Unsupported backup archive kind")
-            archive.verification_status = "verified"
-            archive.verified_at = datetime.now(timezone.utc)
-            archive.verification_detail = detail
+        if await revalidate_archive(archive):
             verified += 1
-            metrics.operations.observe_backup(archive.kind, "verified")
-        except Exception as exc:
-            archive.verification_status = "failed"
-            archive.verification_detail = str(exc)[:2000]
-            metrics.operations.observe_backup(archive.kind, "failed")
     return verified
 
 
 async def prune_operational_backups(session: AsyncSession) -> int:
+    require_storage("backups")
     cutoff = datetime.now(timezone.utc) - timedelta(days=settings.database_backup_retention_days)
     archives = list((await session.scalars(select(BackupArchive).where(BackupArchive.created_at < cutoff))).all())
     removed = 0

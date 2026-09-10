@@ -5,7 +5,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     originals_path: Path = Path("/data/originals")
     derivatives_path: Path = Path("/data/derivatives")
     staging_path: Path = Path("/data/staging")
+    storage_manifest_path: Path | None = None
+    host_owner_email: str | None = None
     upload_chunk_size: int = 1024 * 1024
     max_upload_size: int = 50 * 1024 * 1024 * 1024
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
@@ -96,6 +98,11 @@ class Settings(BaseSettings):
     observability_log_json: bool = False
     metrics_auth_token: str | None = None
     metrics_auth_token_file: Path | None = None
+
+    @field_validator("storage_manifest_path", mode="before")
+    @classmethod
+    def empty_manifest_path(cls, value):
+        return None if value == "" else value
 
     @property
     def account_deletion_ledger_path(self) -> Path:

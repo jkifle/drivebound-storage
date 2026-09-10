@@ -14,6 +14,7 @@ from app.models.replica import AssetReplica
 from app.models.upload_session import UploadSession
 from app.models.storage_policy import StoragePolicy
 from app.models.user import User
+from app.services.host_storage import require_storage, require_storage_path
 from app.services.storage import (
     canonical_storage_path,
     lock_storage_path,
@@ -129,6 +130,7 @@ async def safely_unlink_catalog_path(
         excluding_upload_id=excluding_upload_id,
     ):
         return False
+    require_storage_path(resolved)
     resolved.unlink(missing_ok=True)
     return True
 
@@ -285,6 +287,7 @@ async def safely_purge_asset(
     # ``purging`` is a durable, retryable tombstone. If a worker stops between
     # filesystem cleanup and the database delete, the next scheduled pass can
     # safely finish because every unlink below is idempotent.
+    require_storage("originals", "derivatives", "staging", "replicas", "backups")
     asset.lifecycle_state = "purging"
     await session.flush()
 
