@@ -2,6 +2,7 @@
 
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  type ChangeEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -10,6 +11,7 @@ import {
 } from "react";
 import type { DriveboundUser, HostSetup } from "./auth-gate";
 import { API_URL, apiRequest } from "./api-client";
+import { finishTransfer, type TransferSession } from "./resumable-transfer";
 import { LibraryScreen, type LibraryView } from "./library-screens";
 type TimelineAsset = {
   id: string;
@@ -203,7 +205,7 @@ function retentionLabel(value: string | null, now: number) {
 
 const focusableElements = "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex='-1'])";
 
-function useModalDialog(onClose: () => void, closeDisabled = false) {
+function useModalDialog(onClose: () => void, closeDisabled = false, enabled = true) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
   const closeDisabledRef = useRef(closeDisabled);
@@ -215,7 +217,7 @@ function useModalDialog(onClose: () => void, closeDisabled = false) {
 
   useEffect(() => {
     const dialog = dialogRef.current;
-    if (!dialog) return;
+    if (!dialog || !enabled) return;
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
@@ -236,14 +238,19 @@ function useModalDialog(onClose: () => void, closeDisabled = false) {
       if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
+    const handleBackdrop = (event: MouseEvent) => {
+      if (event.target === dialog && !closeDisabledRef.current) closeRef.current();
+    };
+    dialog.addEventListener("click", handleBackdrop);
     dialog.addEventListener("keydown", handleKey);
     return () => {
       window.cancelAnimationFrame(frame);
       dialog.removeEventListener("keydown", handleKey);
+      dialog.removeEventListener("click", handleBackdrop);
       document.body.style.overflow = previousOverflow;
       previousFocus?.focus();
     };
-  }, []);
+  }, [enabled]);
 
   return dialogRef;
 }
@@ -507,78 +514,72 @@ function Viewer({
   );
 }
 
-function UploadPanel({ initialFiles = [], onClose, onFinished }: { initialFiles?: File[]; onClose: () => void; onFinished: () => void }) {
+function UploadPanel({ open, initialFiles = [], onClose, onOpen, onFinished }: { open: boolean; initialFiles?: File[]; onClose: () => void; onOpen: () => void; onFinished: () => void }) {
   const [uploads, setUploads] = useState<UploadItem[]>([]);
   const [dragging, setDragging] = useState(false);
-  const initialFilesStarted = useRef(false);
+  const initialFilesStarted = useRef<File[] | null>(null);
+  const [dismissed, setDismissed] = useState(false);
+  const retryFiles = useRef(new Map<string, File>());
+  const retrySessions = useRef(new Map<string, TransferSession>());
   const active = uploads.some((item) => item.state === "waiting" || item.state === "uploading");
-  const dialogRef = useModalDialog(onClose, active);
+  const dialogRef = useModalDialog(onClose, false, open);
+
+  useEffect(() => {
+    if (!active) return;
+    const warnBeforeLeaving = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+    window.addEventListener("beforeunload", warnBeforeLeaving);
+    return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
+  }, [active]);
 
   const runUpload = useCallback(async (file: File, id: string) => {
+    setUploads((current) => current.map((item) => item.id === id ? { ...item, state: "uploading", error: undefined } : item));
     try {
-      const create = await apiFetch(`/api/v1/uploads`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          filename: file.name,
-          mime_type: file.type || "application/octet-stream",
-          total_size: file.size,
-          file_modified_at: file.lastModified ? new Date(file.lastModified).toISOString() : null,
-        }),
-      });
-      if (!create.ok) {
-        const problem = await create.json().catch(() => null);
-        throw new Error(problem?.detail ?? "Could not start upload");
+      let upload = retrySessions.current.get(id);
+      if (!upload) {
+        const create = await apiFetch(`/api/v1/uploads`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            filename: file.name,
+            mime_type: file.type || "application/octet-stream",
+            total_size: file.size,
+            file_modified_at: file.lastModified ? new Date(file.lastModified).toISOString() : null,
+          }),
+        });
+        if (!create.ok) {
+          const problem = await create.json().catch(() => null);
+          throw new Error(problem?.detail ?? "Could not start upload");
+        }
+        upload = await create.json();
+        if (!upload) throw new Error("Invalid upload session");
+        retrySessions.current.set(id, upload);
+      } else {
+        const status = await apiFetch(upload.upload_url, { method: "HEAD" });
+        if (!status.ok) throw new Error("This upload session is unavailable. Add the file again to start a new transfer.");
+        upload.offset = Number(status.headers.get("Upload-Offset"));
+        upload.status = status.headers.get("Upload-Status") ?? "active";
       }
-      let upload = await create.json();
       if (upload.duplicate) {
         setUploads((current) => current.map((item) =>
           item.id === id ? { ...item, progress: 100, state: "duplicate" } : item,
         ));
+        retryFiles.current.delete(id);
+        retrySessions.current.delete(id);
         return;
       }
-      let offset = Number(upload.offset);
-      const chunkSize = Number(upload.chunk_size);
-      while (offset < file.size) {
-        const chunkOffset = offset;
-        const chunk = file.slice(offset, Math.min(offset + chunkSize, file.size));
-        let response: Response | null = null;
-        let recovered = false;
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          try {
-            response = await apiFetch(upload.upload_url, {
-              method: "PATCH",
-              headers: { "Upload-Offset": String(offset), "Content-Type": "application/offset+octet-stream" },
-              body: chunk,
-            });
-            if (response.ok) break;
-          } catch {
-            // A HEAD request below recovers the authoritative server offset.
-          }
-          const status = await apiFetch(upload.upload_url, { method: "HEAD" });
-          if (status.ok) {
-            const serverOffset = Number(status.headers.get("Upload-Offset") ?? chunkOffset);
-            if (serverOffset > chunkOffset) {
-              offset = serverOffset;
-              recovered = true;
-              break;
-            }
-          }
-          if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 500 * (attempt + 1)));
-        }
-        if (recovered) continue;
-        if (!response?.ok) throw new Error("Upload interrupted");
-        upload = await response.json();
-        offset = Number(upload.offset);
+      upload = await finishTransfer(file, upload, apiFetch, (progress) => {
+        retrySessions.current.set(id, progress);
         setUploads((current) => current.map((item) =>
           item.id === id
-            ? { ...item, progress: Math.round((offset / file.size) * 100), state: "uploading" }
+            ? { ...item, progress: Math.round((progress.offset / file.size) * 100), state: "uploading" }
             : item,
         ));
-      }
+      });
       setUploads((current) => current.map((item) =>
-        item.id === id ? { ...item, progress: 100, state: upload.duplicate ? "duplicate" : "complete" } : item,
+        item.id === id ? { ...item, progress: 100, state: upload?.duplicate ? "duplicate" : "complete" } : item,
       ));
+      retryFiles.current.delete(id);
+      retrySessions.current.delete(id);
     } catch (reason) {
       setUploads((current) => current.map((item) =>
         item.id === id ? { ...item, state: "failed", error: reason instanceof Error ? reason.message : "Upload failed" } : item,
@@ -588,6 +589,7 @@ function UploadPanel({ initialFiles = [], onClose, onFinished }: { initialFiles?
 
   const addFiles = useCallback(async (files: File[]) => {
     if (!files.length) return;
+    setDismissed(false);
     const queued = files.map((file) => ({
       id: crypto.randomUUID(),
       name: file.name,
@@ -595,6 +597,8 @@ function UploadPanel({ initialFiles = [], onClose, onFinished }: { initialFiles?
       state: "waiting" as const,
     }));
     setUploads((current) => [...current, ...queued]);
+    files.forEach((file, index) => retryFiles.current.set(queued[index].id, file));
+    onClose();
     const queue = files.map((file, index) => ({ file, id: queued[index].id }));
     const workers = Array.from({ length: Math.min(3, queue.length) }, async () => {
       while (queue.length) {
@@ -604,11 +608,11 @@ function UploadPanel({ initialFiles = [], onClose, onFinished }: { initialFiles?
     });
     await Promise.all(workers);
     onFinished();
-  }, [onFinished, runUpload]);
+  }, [onClose, onFinished, runUpload]);
 
   useEffect(() => {
-    if (initialFilesStarted.current || !initialFiles.length) return;
-    initialFilesStarted.current = true;
+    if (initialFilesStarted.current === initialFiles || !initialFiles.length) return;
+    initialFilesStarted.current = initialFiles;
     void addFiles(initialFiles);
   }, [addFiles, initialFiles]);
 
@@ -617,12 +621,24 @@ function UploadPanel({ initialFiles = [], onClose, onFinished }: { initialFiles?
     event.target.value = "";
   };
 
+  if (!open) {
+    if (!uploads.length || dismissed) return null;
+    const finished = uploads.filter((item) => item.state === "complete" || item.state === "duplicate").length;
+    const failed = uploads.filter((item) => item.state === "failed").length;
+    const progress = Math.round(uploads.reduce((sum, item) => sum + item.progress, 0) / uploads.length);
+    return <section className="upload-toast" aria-label="Upload progress">
+      <div role="status"><strong>{active ? "Uploading to your drive" : failed ? "Uploads need attention" : "Uploads saved"}</strong><small>{finished} of {uploads.length} saved{failed ? ` - ${failed} failed` : ""}</small></div>
+      <progress max={100} value={progress} aria-label="Total transfer progress" />
+      <div className="upload-toast-actions"><button onClick={onOpen}>View details</button>{!active && <button onClick={() => setDismissed(true)} aria-label="Dismiss upload progress">Dismiss</button>}</div>
+    </section>;
+  }
+
   return (
     <div className="upload-scrim" ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="upload-title" aria-busy={active} tabIndex={-1}>
       <section className="upload-panel">
         <div className="upload-heading">
           <div><span className="eyebrow">Resumable transfer</span><h2 id="upload-title">Add to Drivebound</h2></div>
-          <button className="icon-button dark" onClick={onClose} disabled={active} aria-label="Close upload panel">×</button>
+          <button className="icon-button dark" onClick={onClose} aria-label="Minimize upload panel">−</button>
         </div>
         <label
           className={`drop-zone ${dragging ? "dragging" : ""}`}
@@ -645,7 +661,8 @@ function UploadPanel({ initialFiles = [], onClose, onFinished }: { initialFiles?
           <div className="upload-list" aria-live="polite">
             {uploads.map((item) => (
               <div className="upload-row" key={item.id}>
-                <div className="upload-file"><strong>{item.name}</strong><span>{item.error ?? item.state}</span></div>
+                <div className="upload-file"><strong>{item.name}</strong><span>{item.error ?? (item.progress === 100 && item.state === "uploading" ? "Saving to drive..." : item.state)}</span></div>
+                {item.state === "failed" && <button className="secondary-button" onClick={() => { const file = retryFiles.current.get(item.id); if (file) void runUpload(file, item.id).then(onFinished); }}>Retry</button>}
                 <div className="progress-track" role="progressbar" aria-label={`Upload progress for ${item.name}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={item.progress} aria-valuetext={`${item.progress}% ${item.state}`}><span style={{ width: `${item.progress}%` }} /></div>
               </div>
             ))}
@@ -1337,7 +1354,7 @@ export function PhotoLibrary({ user }: { user: DriveboundUser }) {
         {error && assets.length > 0 && <button className="inline-error" onClick={() => void loadPage()}>Couldn’t load more — retry</button>}
       </div> : <div className="discovery-scroll"><LibraryScreen view={view} /></div>}
 
-      {uploadOpen && <UploadPanel initialFiles={droppedFiles} onClose={() => { setUploadOpen(false); setDroppedFiles([]); }} onFinished={() => void loadPage(true)} />}
+      <UploadPanel open={uploadOpen} initialFiles={droppedFiles} onOpen={() => setUploadOpen(true)} onClose={() => { setUploadOpen(false); setDroppedFiles([]); }} onFinished={() => void loadPage(true)} />
       {storageOpen && <StoragePanel onClose={() => setStorageOpen(false)} onLibraryChanged={() => void loadPage(true)} />}
       {trashOpen && <TrashPanel onClose={() => setTrashOpen(false)} onChanged={() => void loadPage(true)} />}
       {selected && <Viewer key={selected.id} asset={selected} assets={assets} onClose={() => setSelected(null)} onSelect={setSelected} onChanged={() => void loadPage(true)} />}

@@ -22,7 +22,7 @@
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
 html, body { min-height: 100%; margin: 0; background: var(--surface); color: var(--ink); }
-body { overflow: hidden; font-family: "DM Sans", "Segoe UI", sans-serif; }
+body { overflow-x: clip; overflow-y: auto; font-family: "DM Sans", "Segoe UI", sans-serif; }
 button, input, select, textarea { font: inherit; }
 button, a, label, summary { -webkit-tap-highlight-color: transparent; }
 button, a, input, select, textarea, summary { transition: box-shadow 300ms ease-out, transform 300ms ease-out, background 300ms ease-out; }
@@ -142,7 +142,7 @@ h1, h2, h3, .brand { font-family: "Plus Jakarta Sans", "Segoe UI", sans-serif; l
 .empty-mark { width: 76px; height: 76px; margin-bottom: 30px; display: grid; place-items: center; border-radius: 26px; color: var(--accent); box-shadow: var(--inset-deep); font-size: 24px; }
 .empty-state h1 { max-width: 650px; margin: 0; font-size: clamp(40px, 6vw, 72px); line-height: .98; font-weight: 800; }.empty-state p { max-width: 540px; margin: 24px 0 30px; color: var(--muted); font-size: 17px; line-height: 1.65; }.empty-state button { min-height: 50px; border: 0; border-radius: 16px; padding: 0 23px; background: var(--accent); color: white; box-shadow: var(--raised-small); font-weight: 700; cursor: pointer; }
 
-.upload-scrim, .storage-scrim { position: fixed; inset: 0; z-index: 50; background: rgb(99 109 121 / .25); backdrop-filter: blur(10px); outline: 0; }
+.upload-scrim, .storage-scrim { position: fixed; inset: 0; z-index: 50; background: rgb(99 109 121 / .25); outline: 0; }
 .upload-scrim { display: grid; place-items: center; padding: 20px; }
 .library-drop-overlay { position: fixed; inset: 18px; z-index: 49; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; border: 2px dashed var(--accent); border-radius: 28px; background: rgb(233 238 245 / .9); color: var(--accent); pointer-events: none; box-shadow: var(--inset-deep); font-size: clamp(20px, 3vw, 34px); }
 .upload-panel, .storage-panel { background: var(--surface); box-shadow: var(--raised-hover); }
@@ -279,3 +279,49 @@ h1, h2, h3, .brand { font-family: "Plus Jakarta Sans", "Segoe UI", sans-serif; l
 }
 @media (max-width: 430px) { .topbar > .brand > span:last-child, .landing-nav .brand > span:last-child { display: none; }.landing-nav { gap: 10px; }.landing-nav nav { gap: 6px; }.landing-nav .primary-button, .landing-nav .secondary-button { min-height: 44px; padding-inline: 10px; }.hero-search { display: grid; grid-template-columns: minmax(0, 1fr); }.hero-search button { width: 100%; } }
 @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } [data-reveal] { opacity: 1 !important; transform: none !important; filter: none !important; } }
+
+/* Let the actual header height determine the remaining scrolling area. */
+.library-shell { height: 100dvh; min-height: 0; display: flex; flex-direction: column; }
+.topbar { flex: 0 0 auto; height: auto; min-height: 86px; padding-block: 12px; gap: 16px; grid-template-columns: auto minmax(0, 1fr) auto auto; }
+.library-shell > .timeline-scroll, .library-shell > .discovery-scroll { flex: 1 1 auto; min-height: 0; height: auto; }
+.topbar > *, .header-actions, .profile-header > *, .storage-panel > *, .storage-panel label { min-width: 0; }
+.header-actions, .profile-header, .profile-header nav { flex-wrap: wrap; gap: 12px; }
+.account-button { max-width: 180px; }
+.account-button small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.library-nav { min-width: 0; overflow-x: auto; justify-content: flex-start; }
+.centered-page { min-height: 100dvh; height: auto; }
+.centered-page > *, .auth-form-wrap > * { min-width: 0; max-width: 100%; }
+.upload-panel { max-height: calc(100dvh - 40px); }
+.storage-panel { max-height: 100dvh; overflow-x: hidden; overflow-wrap: anywhere; }
+.storage-heading, .upload-heading, .section-title { gap: 14px; }
+.storage-heading > div, .upload-heading > div { min-width: 0; }
+.storage-heading .icon-button, .upload-heading .icon-button { flex-shrink: 0; }
+.section-title { flex-wrap: wrap; }
+.protection-card { align-items: stretch; flex-direction: column; }
+.protection-actions, .sync-conflict-actions { display: flex; flex-wrap: wrap; gap: 12px; }
+.protection-actions button, .sync-conflict-actions button { white-space: normal; flex: 1 1 140px; padding: 10px 14px; }
+.library-form { grid-template-columns: minmax(0, 1fr); }
+.library-card { grid-template-columns: minmax(0, 1fr); }
+.library-card button, .library-form button { padding: 12px 14px; }
+.drive-card-top { grid-template-columns: auto minmax(0, 1fr) auto; }
+.upload-file { min-width: 0; overflow-wrap: anywhere; }
+.upload-toast { position: fixed; z-index: 45; right: max(16px, env(safe-area-inset-right)); bottom: max(16px, env(safe-area-inset-bottom)); width: min(340px, calc(100vw - 32px)); padding: 16px 20px; border-radius: 20px; background: var(--surface); box-shadow: var(--raised-hover); border: 1px solid rgb(255 255 255 / .6); }
+.upload-toast strong, .upload-toast small { display: block; }
+.upload-toast small { color: var(--muted); margin-top: 5px; }
+.upload-toast progress { width: 100%; height: 8px; margin-top: 12px; accent-color: var(--accent); }
+.upload-toast-actions { display: flex; justify-content: space-between; gap: 12px; }
+.upload-toast-actions button { border: 0; background: transparent; color: var(--accent); cursor: pointer; font-weight: 700; }
+@media (max-width: 1100px) {
+  .topbar { grid-template-columns: minmax(0, 1fr) auto; }
+  .library-nav { grid-column: 1 / -1; grid-row: 2; justify-self: stretch; }
+  .storage-summary { display: none; }
+  .account-button small { display: none; }
+}
+@media (max-width: 620px) {
+  .topbar { gap: 8px; min-height: 72px; }
+  .header-actions { gap: 8px; }
+  .storage-panel { padding-inline: 18px; }
+  .auth-form-wrap { padding-inline: 16px; }
+  .centered-page { padding: 16px; }
+  .token-card { padding: 24px 18px; }
+}

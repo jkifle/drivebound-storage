@@ -77,6 +77,10 @@ Invoke-ValidationStep "Frontend production build" (Join-Path $ProjectRoot "front
     npm run build
 }
 
+Invoke-ValidationStep "Upload recovery regressions" (Join-Path $ProjectRoot "frontend") {
+    npm run test:uploads
+}
+
 Invoke-ValidationStep "Mobile type check" (Join-Path $ProjectRoot "mobile") {
     npm run typecheck
 }

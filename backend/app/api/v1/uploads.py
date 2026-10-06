@@ -1,4 +1,6 @@
 import asyncio
+import errno
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -24,6 +26,35 @@ from app.services.storage import canonical_storage_path, sha256_file
 from app.worker.tasks import process_asset_task
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
+logger = logging.getLogger(__name__)
+
+
+async def finalize_upload_asset(session: AsyncSession, upload: UploadSession, staging_path: Path, checksum: str):
+    """Return actionable, non-secret diagnostics without discarding failed uploads."""
+    upload_id = upload.id
+    try:
+        return await persist_managed_asset(
+            session, user_id=upload.user_id, staged_path=staging_path,
+            checksum=checksum, file_size=upload.total_size, mime_type=upload.mime_type,
+            filename=upload.filename, file_created_at=upload.file_created_at,
+            file_modified_at=upload.file_modified_at,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Do not log exception strings: they can contain private paths or SQL.
+        error_number = getattr(exc, "errno", None)
+        logger.error("Upload finalization failed: session=%s error=%s errno=%s",
+                     upload_id, type(exc).__name__, error_number)
+        if error_number == errno.ENOSPC:
+            reason = "The destination drive is full. Free space and retry."
+        elif error_number in (errno.EACCES, errno.EPERM, errno.EROFS):
+            reason = "The destination drive could not be written. Check its permissions and that it is writable."
+        elif error_number in (errno.ENOTSUP, errno.EXDEV, errno.ENOSYS):
+            reason = "The destination filesystem does not support the required file publication operation. Check the drive format and Docker mount."
+        else:
+            reason = "Drivebound could not finish saving this upload. Check the server storage and retry."
+        raise HTTPException(status_code=503, detail=f"{reason} Diagnostic: upload {upload_id}, {type(exc).__name__}.") from exc
 
 
 @dataclass(frozen=True)
@@ -215,17 +246,7 @@ async def append_upload(
         staging_path.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail="Completed upload checksum does not match")
 
-    asset, duplicate = await persist_managed_asset(
-        session,
-        user_id=upload.user_id,
-        staged_path=staging_path,
-        checksum=checksum,
-        file_size=upload.total_size,
-        mime_type=upload.mime_type,
-        filename=upload.filename,
-        file_created_at=upload.file_created_at,
-        file_modified_at=upload.file_modified_at,
-    )
+    asset, duplicate = await finalize_upload_asset(session, upload, staging_path, checksum)
     upload = await session.get(UploadSession, upload_id)
     if upload is not None:
         upload.status = "complete"
