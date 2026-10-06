@@ -73,6 +73,22 @@ Assert-RemoteRejected { Get-RemoteEnvironment $existing $dns $unsafeMail } 'SMTP
     $status = Invoke-TailscaleJson 'fixture' @('status','--json')
     Assert-Remote ($status.BackendState -eq 'Running') 'Native stderr polluted Tailscale JSON.'
 }
+& {
+    $priorDiagnostics = Get-DriveboundDiagnosticState
+    try {
+        $Script:DriveboundDiagnostics = @{Secrets = New-Object 'System.Collections.Generic.List[string]'}
+        Register-DriveboundDiagnosticSecrets -Values @{SMTP_PASSWORD = 'mail-fixture-sensitive'}
+        $script:CapturedRemoteDiagnostic = ''
+        function Add-DriveboundDiagnostic { param([string]$Message) $script:CapturedRemoteDiagnostic += $Message }
+        function Invoke-DriveboundNative {
+            return [pscustomobject]@{ExitCode = 9; StdOut = 'PRIVATE_DEVICE_INVENTORY'; StdErr = 'fixture failure mail-fixture-sensitive'; TimedOut = $false}
+        }
+        Assert-RemoteRejected { Invoke-TailscaleJson 'fixture' @('status', '--json') } 'not ready'
+        Assert-Remote ($script:CapturedRemoteDiagnostic.Contains('exit code 9')) 'Remote diagnostics lost the exit code.'
+        Assert-Remote (-not $script:CapturedRemoteDiagnostic.Contains('mail-fixture-sensitive')) 'Remote diagnostics leaked SMTP credentials.'
+        Assert-Remote (-not $script:CapturedRemoteDiagnostic.Contains('PRIVATE_DEVICE_INVENTORY')) 'Remote diagnostics included device inventory stdout.'
+    } finally { $Script:DriveboundDiagnostics = $priorDiagnostics }
+}
 if ($ComposeRoundTrip) {
     if (-not $DockerExecutable) { throw 'Provide the Docker executable for the optional config-only parser test.' }
     $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('drivebound-remote-parser-' + [Guid]::NewGuid().ToString('N'))
@@ -80,7 +96,7 @@ if ($ComposeRoundTrip) {
     try {
         $fixtureEnv = Join-Path $fixtureRoot 'fixture.env'
         $fixtureCompose = Join-Path $fixtureRoot 'compose.yml'
-        $samples = @('trailing\', 'two\\slashes', 'slash\''quote', 'cash${UNSET_VARIABLE}$', 'double"quote', 'space and # comment', "tab`tvalue", '')
+        $samples = @('trailing\', 'two\\slashes', 'slash\''quote', 'cash${UNSET_VARIABLE}$', 'double"quote', 'space and # comment', "tab`tvalue", '', '$$two dollars', 'slash\${UNSET_VARIABLE}')
         $environmentLines = @()
         $composeLines = @('services:', '  fixture:', '    image: scratch', '    environment:')
         for ($index = 0; $index -lt $samples.Count; $index++) {
@@ -94,6 +110,10 @@ if ($ComposeRoundTrip) {
         $configuration = $parsed.StdOut | ConvertFrom-Json
         for ($index = 0; $index -lt $samples.Count; $index++) {
             $value = Get-RemoteProperty $configuration.services.fixture.environment "FIXTURE_$index"
+            # config's renderer doubles every dollar for safe re-parsing, even
+            # in JSON (docker/compose cmd/compose/config.go, runConfig). Undo
+            # that one display layer before comparing the actual parsed value.
+            $value = $value.Replace('$$', '$')
             Assert-Remote ($value -ceq $samples[$index]) "Compose credential roundtrip failed for fixture $index."
         }
         Write-Host 'Actual Docker Compose credential roundtrip passed; config only, no daemon or email used.' -ForegroundColor Green

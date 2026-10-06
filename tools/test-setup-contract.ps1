@@ -40,33 +40,52 @@ function Run-TestSetup {
 try {
     [void][IO.Directory]::CreateDirectory($TemporaryRoot)
     . $SetupScript -LibraryOnly -NonInteractive -NoStart -NoBrowser -OwnerEmail 'owner@example.test' -ProjectRootOverride $TemporaryRoot
-    $nativeFixture = Join-Path $TemporaryRoot 'native argument fixture.ps1'
-    Write-DurableText $nativeFixture @'
-[Console]::Error.WriteLine('disposable stderr fixture')
-ConvertTo-Json -InputObject @($args) -Compress
-exit 7
+    $nativeFixture = Join-Path $TemporaryRoot 'native argument fixture.exe'
+    # powershell.exe -File discards empty arguments itself. Use a native entry
+    # point so this checks the wrapper's CRT quoting, not another shell parser.
+    Add-Type -OutputAssembly $nativeFixture -OutputType ConsoleApplication -TypeDefinition @'
+using System;
+using System.Text;
+public class DriveboundNativeFixture {
+    public static int Main(string[] args) {
+        Console.Error.WriteLine("disposable stderr fixture");
+        Console.WriteLine(args.Length);
+        foreach (string arg in args) Console.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(arg)));
+        return 7;
+    }
+}
 '@
-    $powershell = (Get-Command powershell.exe).Source
     $argumentSamples = @('with spaces', 'quote"inside', 'trailing\', 'two\\slashes', '$literal', '')
-    $native = Invoke-DriveboundNative -FilePath $powershell -Arguments (@('-NoProfile', '-File', $nativeFixture) + $argumentSamples) -TimeoutSeconds 10
+    $native = Invoke-DriveboundNative -FilePath $nativeFixture -Arguments $argumentSamples -TimeoutSeconds 10
     Assert-Condition ($native.ExitCode -eq 7 -and $native.StdErr.Contains('disposable stderr fixture')) 'Native stderr interrupted exit-code handling.'
     Assert-Condition ($ErrorActionPreference -eq 'Stop') 'Native invocation changed caller error preferences.'
-    $received = @($native.StdOut | ConvertFrom-Json)
-    Assert-Condition ($received.Count -eq $argumentSamples.Count) 'Native argument count changed.'
+    $received = $native.StdOut -split '\r?\n'
+    Assert-Condition ([int]$received[0] -eq $argumentSamples.Count) 'Native argument count changed.'
     for ($index = 0; $index -lt $argumentSamples.Count; $index++) {
-        Assert-Condition ($received[$index] -ceq $argumentSamples[$index]) 'Native argument quoting did not preserve a fixture value.'
+        $decoded = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($received[$index + 1]))
+        Assert-Condition ($decoded -ceq $argumentSamples[$index]) 'Native argument quoting did not preserve a fixture value.'
     }
     # Exercise the actual readiness function with a process that writes stderr,
     # without contacting Docker or launching Desktop.
     $realNative = ${function:Invoke-DriveboundNative}
     & {
-        function Get-Command { return [pscustomobject]@{Source = $powershell} }
+        function Get-Command { return [pscustomobject]@{Source = $nativeFixture} }
         function Invoke-DriveboundNative {
-            & $realNative -FilePath $powershell -Arguments @('-NoProfile', '-File', $nativeFixture) -TimeoutSeconds 10
+            & $realNative -FilePath $nativeFixture -Arguments @() -TimeoutSeconds 10
         }
         Assert-Condition (-not (Test-DockerReady)) 'Stopped-daemon stderr did not return a retryable false readiness result.'
     }
     Assert-Condition (Test-Path -LiteralPath (Join-Path $SourceProjectRoot 'Drivebound Status.cmd')) 'The user-facing Status launcher is missing.'
+    & {
+        $script:ReadyChecks = 0
+        $script:LaunchedDesktop = ''
+        function Test-DockerReady { $script:ReadyChecks++; return $script:ReadyChecks -gt 1 }
+        function Test-Path { param([string]$LiteralPath) return $LiteralPath.EndsWith('Programs\DockerDesktop\Docker Desktop.exe') }
+        function Start-Process { param([string]$FilePath, [string]$WindowStyle) $script:LaunchedDesktop = $FilePath }
+        function Start-Sleep { }
+        Wait-ForDocker
+        Assert-Condition ($script:LaunchedDesktop -eq (Join-Path $env:LOCALAPPDATA 'Programs\DockerDesktop\Docker Desktop.exe')) 'A single installed Docker Desktop candidate was reduced to its first character.'
+    }
     function Get-HostVolumeIdentity([string]$Path) {
         Assert-PlainLocalPath $Path
         return @{volume_id = 'test-volume-one'; physical_disk_id = 'test-disk-one'; root = [IO.Path]::GetPathRoot($Path)}
@@ -160,6 +179,17 @@ exit 7
     Assert-Condition ((Get-ProtectionIndependence $roles) -eq 'independent_disk') 'Three distinct disks were not recognized.'
     $roles.imports.physical_disk_id = $null
     Assert-Condition ((Get-ProtectionIndependence $roles) -eq 'unverified') 'Unknown import disk identity was credited as independent protection.'
+    $named = New-TestInstallation 'named-project'
+    Set-TestContext $named -Paths
+    $namedTemplate = [IO.File]::ReadAllText($Script:EnvironmentTemplatePath)
+    Write-DurableText $Script:EnvironmentTemplatePath ($namedTemplate + "`nCOMPOSE_PROJECT_NAME=drivebound-isolated-fixture`n")
+    Run-TestSetup
+    Assert-Condition ((Get-InstallationState).compose_project_name -ceq 'drivebound-isolated-fixture') 'Fresh setup ignored its explicit Compose project identity.'
+    Assert-Condition ((Read-EnvironmentMap $Script:EnvironmentPath).COMPOSE_PROJECT_NAME -ceq 'drivebound-isolated-fixture') 'Saved environment and installation project identities disagree.'
+    Write-DurableText $Script:EnvironmentTemplatePath ($namedTemplate + "`nCOMPOSE_PROJECT_NAME=another-template-name`n")
+    Set-TestContext $named
+    Run-TestSetup
+    Assert-Condition ((Get-InstallationState).compose_project_name -ceq 'drivebound-isolated-fixture') 'A template update changed an existing installation identity.'
     Write-Host "Guided setup contract passed ($script:Assertions assertions)." -ForegroundColor Green
 } finally {
     if (Test-Path -LiteralPath $TemporaryRoot) {

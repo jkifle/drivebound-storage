@@ -63,6 +63,34 @@ missing credential, changed owner or relocation fails with recovery guidance.
 File-backed-secret production deployments must retain their existing deployment
 workflow; this wizard will not rewrite them.
 
+### Setup fails or its window closes
+
+Every Setup, Start, Stop, Status, and Remote Access run now records timestamped
+stages in a private log under `.drivebound/logs/setup-<timestamp>-<session>.log`.
+On failure, the window shows the stage, error type, reason, script location,
+and exact log path. Docker/Compose failures include their exit code or timeout
+and sanitized failure output. Readiness failures report API and website results
+separately. A running Windows-container engine is rejected with Linux-container
+guidance rather than being mistaken for a working Drivebound engine.
+
+1. Retry using the updated **Drivebound Setup** or **Drivebound Start** launcher.
+2. If it fails, dismiss the error dialog. The console stays open until you press
+   a key. Copy the details and note the displayed diagnostic log path.
+3. Review that log before sharing it. Passwords, registered encryption keys,
+   tokens, email addresses, and common credential formats are redacted. Logs
+   can still contain local folder names and technical details. Never share the
+   `.env`, configuration recovery files, or the entire `.drivebound` folder.
+4. If the project folder cannot store a private log, setup tries a private
+   temporary folder and shows its path. If logging itself fails, the original
+   error stays visible with instructions to copy it.
+
+The launchers also retain PowerShell startup and syntax errors that occur before
+logging initializes; these may have no saved log. Unattended runs using
+`-NonInteractive` (or launcher environment variable `DRIVEBOUND_NONINTERACTIVE=1`)
+return a nonzero exit code without pausing. Logs are automatic, bounded per run,
+and retained; they are not uploaded anywhere. Diagnostic collection does not
+reset Docker, regenerate keys, or delete existing accounts or media.
+
 ### Docker closes with an Inference manager error
 
 If Docker reports `initializing Inference manager` and cannot access

@@ -34,10 +34,15 @@ function Invoke-DriveboundNative {
         $stderr = $process.StandardError.ReadToEndAsync()
         $finished = if ($TimeoutSeconds -gt 0) { $process.WaitForExit($TimeoutSeconds * 1000) } else { $process.WaitForExit(); $true }
         if (-not $finished) {
-            try { $process.Kill(); $process.WaitForExit() } catch { }
-            return [pscustomobject]@{ExitCode = -1; StdOut = ''; StdErr = ''; TimedOut = $true}
+            try { $process.Kill(); [void]$process.WaitForExit(2000) } catch { }
         }
-        return [pscustomobject]@{ExitCode = $process.ExitCode; StdOut = $stdout.GetAwaiter().GetResult(); StdErr = $stderr.GetAwaiter().GetResult(); TimedOut = $false}
+        # A descendant can inherit a pipe after the parent exits. Bound draining
+        # too, retaining completed output without hanging on that descendant.
+        try { [void][Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout, $stderr), 2000) } catch { }
+        $outText = if ($stdout.Status -eq 'RanToCompletion') { $stdout.GetAwaiter().GetResult() } else { '' }
+        $errText = if ($stderr.Status -eq 'RanToCompletion') { $stderr.GetAwaiter().GetResult() } else { '' }
+        if ($stdout.Status -ne 'RanToCompletion' -or $stderr.Status -ne 'RanToCompletion') { $errText += "`nSome command output was unavailable because a child process kept its output stream open." }
+        return [pscustomobject]@{ExitCode = $(if ($finished) { $process.ExitCode } else { -1 }); StdOut = $outText; StdErr = $errText; TimedOut = -not $finished}
     } finally { $process.Dispose() }
 }
 

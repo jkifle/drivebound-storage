@@ -23,6 +23,11 @@ Reboot, real-drive interruption and cellular acceptance remain required pilot ch
 See the [guided Windows setup](docs/operations/windows-setup.md) for the complete
 storage and recovery explanation.
 
+To test your always-on PC as a personal cloud, follow the
+[laptop and phone test guide](docs/operations/remote-device-test-guide.md).
+Windows Remote Desktop is not required; external devices use the website or
+installed mobile app over your private Tailscale connection.
+
 For command-line or non-Windows development, copy `.env.example` to `.env`,
 replace every placeholder secret, and run `docker compose up --build -d`.
 Set `HOST_OWNER_EMAIL` to the verified account permitted to connect host import

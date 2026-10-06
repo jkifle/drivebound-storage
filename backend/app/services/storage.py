@@ -103,11 +103,13 @@ def commit_original(staged_path: Path, final_path: Path) -> bool:
     except Exception:
         if created:
             # The path was never published as a database-backed original.
+            require_storage_path(final_path)
             final_path.unlink(missing_ok=True)
         raise
-    finally:
-        require_storage_path(staged_path)
-        staged_path.unlink(missing_ok=True)
+    # Keep resumable upload bytes on destination failure, just as the encrypted
+    # publication path does. Only successful publication/adoption consumes them.
+    require_storage_path(staged_path)
+    staged_path.unlink(missing_ok=True)
     return created
 
 

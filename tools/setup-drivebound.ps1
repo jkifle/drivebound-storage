@@ -28,6 +28,7 @@ $Script:BaseComposePath = Join-Path $Script:ProjectRoot "docker-compose.yml"
 $Script:UserComposePath = Join-Path $Script:ProjectRoot "docker-compose.user.yml"
 $Script:DevelopmentMediaKey = "RZAIpFM5CAciKTy4UABCTvvyD83LfeB9r_ZR4z0LnKQ="
 . (Join-Path $PSScriptRoot 'setup-state.ps1')
+. (Join-Path $PSScriptRoot 'setup-diagnostics.ps1')
 
 function Show-DriveboundMessage {
     param(
@@ -160,6 +161,7 @@ function Read-EnvironmentMap {
         $name = $line.Substring(0, $separator).Trim()
         $values[$name] = $line.Substring($separator + 1)
     }
+    Register-DriveboundDiagnosticSecrets -Values $values
     return $values
 }
 
@@ -283,7 +285,7 @@ function Get-ComposeArguments {
     param([string[]]$AdditionalArguments)
 
     $state = Get-InstallationState
-    $arguments = @('compose', '--project-directory', $Script:ProjectRoot, '--env-file', $Script:EnvironmentPath)
+    $arguments = @('compose', '--progress', 'plain', '--project-directory', $Script:ProjectRoot, '--env-file', $Script:EnvironmentPath)
     if ($state) { $arguments += @('--project-name', $state.compose_project_name) }
     $arguments += @('-f', $Script:BaseComposePath)
     if (Test-Path -LiteralPath $Script:UserComposePath) {
@@ -295,45 +297,87 @@ function Get-ComposeArguments {
     return ,$arguments
 }
 
-function Test-DockerReady {
-    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-        foreach ($directory in @((Join-Path $env:ProgramFiles 'Docker\Docker\resources\bin'), (Join-Path $env:LOCALAPPDATA 'Programs\DockerDesktop\resources\bin'))) {
+function Get-DriveboundDockerCommand {
+    if (-not (Get-Command docker.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+        foreach ($directory in @((Join-Path $env:ProgramFiles 'Docker\Docker\resources\bin'), (Join-Path $env:LOCALAPPDATA 'Programs\DockerDesktop\resources\bin'), (Join-Path $env:LOCALAPPDATA 'Programs\Docker\Docker\resources\bin'))) {
             if (Test-Path -LiteralPath (Join-Path $directory 'docker.exe')) { $env:PATH = "$directory;$env:PATH"; break }
         }
     }
-    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-        return $false
+    # Duplicate PATH entries can yield several CommandInfo objects. A native
+    # process needs one executable path, never an array or an extensionless shim.
+    return Get-Command docker.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+}
+
+function Get-DriveboundNativeFailure {
+    param($Result)
+    $detail = if ($Result.TimedOut) { 'The command exceeded its time limit.' } else { "Exit code: $($Result.ExitCode)." }
+    # Failure output can contain build/configuration secrets. Never print it raw.
+    $output = if ($Result.StdErr.Trim()) { $Result.StdErr.Trim() } else { $Result.StdOut.Trim() }
+    if ($output) { $detail += "`n$(Protect-DriveboundDiagnosticText -Text $output)" }
+    return $detail
+}
+
+function Test-DockerReady {
+    $Script:DockerEngineMismatch = $false
+    try {
+        $docker = Get-DriveboundDockerCommand
+        if (-not $docker) {
+            $Script:LastDockerDiagnostic = 'Docker CLI was not found on PATH or in the supported Docker Desktop install folders.'
+            return $false
+        }
+        $result = Invoke-DriveboundNative -FilePath $docker.Source -Arguments @('info', '--format', '{{.OSType}}|{{.ServerVersion}}') -TimeoutSeconds 10
+        if ($result.ExitCode -eq 0 -and -not $result.TimedOut) {
+            if ($result.StdOut.Trim().StartsWith('linux|')) { return $true }
+            $Script:DockerEngineMismatch = $true
+            $Script:LastDockerDiagnostic = 'Docker is responding, but it is not a Linux-container engine. In Docker Desktop, switch to Linux containers; no setting was changed automatically.'
+        } else { $Script:LastDockerDiagnostic = Get-DriveboundNativeFailure $result }
+    } catch {
+        $Script:LastDockerDiagnostic = Protect-DriveboundDiagnosticText -Text $_.Exception.Message
     }
-    $result = Invoke-DriveboundNative -FilePath (Get-Command docker).Source -Arguments @('info', '--format', '{{.ServerVersion}}') -TimeoutSeconds 10
-    return $result.ExitCode -eq 0
+    return $false
 }
 
 function Wait-ForDocker {
+    param([ValidateRange(1, 900)][int]$TimeoutSeconds = 180)
+    Set-DriveboundStage -Stage 'Checking Docker Linux engine'
     if (Test-DockerReady) {
+        Add-DriveboundDiagnostic -Message 'Docker Linux engine is ready.'
         return
     }
+    Add-DriveboundDiagnostic -Message "Initial Docker check: $Script:LastDockerDiagnostic"
+    if ($Script:DockerEngineMismatch) { throw $Script:LastDockerDiagnostic }
 
-    $candidates = @(
+    $candidates = @(@(
         (Join-Path $env:ProgramFiles "Docker\Docker\Docker Desktop.exe"),
         (Join-Path $env:LOCALAPPDATA "Programs\DockerDesktop\Docker Desktop.exe"),
         (Join-Path $env:LOCALAPPDATA "Programs\Docker\Docker\Docker Desktop.exe"),
         (Join-Path $env:LOCALAPPDATA "Docker\Docker Desktop.exe")
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
 
     if ($candidates.Count -eq 0) {
-        throw "Docker Desktop is not installed. Install Docker Desktop, start it once, and then run Drivebound Setup again."
+        throw "Docker Desktop could not be found in the supported install folders. Open your Docker installation manually, or install Docker Desktop, then retry.`n$Script:LastDockerDiagnostic"
     }
 
+    Set-DriveboundStage -Stage 'Starting Docker Desktop'
     Write-Host "Starting Docker Desktop. This can take a minute..." -ForegroundColor Cyan
+    Add-DriveboundDiagnostic -Message "Desktop executable: $($candidates[0])"
     Start-Process -FilePath $candidates[0] -WindowStyle Hidden | Out-Null
-    $deadline = [DateTime]::UtcNow.AddMinutes(3)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $nextProgress = [DateTime]::UtcNow.AddSeconds(15)
     do {
         Start-Sleep -Seconds 2
         if (Test-DockerReady) {
+            Add-DriveboundDiagnostic -Message 'Docker Linux engine became ready.'
             return
         }
+        if ($Script:DockerEngineMismatch) { throw $Script:LastDockerDiagnostic }
+        if ([DateTime]::UtcNow -ge $nextProgress) {
+            Write-Host 'Still waiting for Docker. Open Docker Desktop if it needs your attention...'
+            Add-DriveboundDiagnostic -Message "Docker is still unavailable: $Script:LastDockerDiagnostic"
+            $nextProgress = [DateTime]::UtcNow.AddSeconds(15)
+        }
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw "Docker Desktop did not finish starting. Open Docker Desktop and resolve its startup message. If virtualization is unavailable, enable it in PC firmware and enable Windows Virtual Machine Platform, then restart Windows. Retry with Drivebound Start."
+    throw "Docker Desktop did not become ready within $TimeoutSeconds seconds. Open Docker Desktop and resolve its startup message, then retry Drivebound Start. Do not reset Docker or replace your encryption keys.`nLast Docker check:`n$Script:LastDockerDiagnostic"
 }
 
 function Invoke-DriveboundCompose {
@@ -342,10 +386,21 @@ function Invoke-DriveboundCompose {
     $composeArguments = Get-ComposeArguments -AdditionalArguments $Arguments
     Push-Location -LiteralPath $Script:ProjectRoot
     try {
-        $result = Invoke-DriveboundNative -FilePath (Get-Command docker).Source -Arguments $composeArguments
-        if ($result.ExitCode -ne 0) {
-            throw "Drivebound could not complete the Docker startup step."
+        $docker = Get-DriveboundDockerCommand
+        if (-not $docker) { throw 'Docker CLI is unavailable. Open Docker Desktop and retry.' }
+        $operation = if ($Arguments[0] -eq 'up') { 'Building and starting Drivebound containers' } else { 'Running Drivebound container operation' }
+        Set-DriveboundStage -Stage $operation
+        $result = Invoke-DriveboundNative -FilePath $docker.Source -Arguments $composeArguments -TimeoutSeconds 1800
+        if ($result.ExitCode -ne 0 -or $result.TimedOut) {
+            # BuildKit can put npm/compiler details on stdout and only its final
+            # Dockerfile summary on stderr. Retain a sanitized tail of each.
+            if ($result.StdOut) { Add-DriveboundDiagnostic -Message ("Docker Compose stdout:`n" + (Protect-DriveboundDiagnosticText -Text $result.StdOut)) }
+            if ($result.StdErr) { Add-DriveboundDiagnostic -Message ("Docker Compose stderr:`n" + (Protect-DriveboundDiagnosticText -Text $result.StdErr)) }
+            $detail = Get-DriveboundNativeFailure $result
+            Add-DriveboundDiagnostic -Message "Docker Compose failure: $detail"
+            throw "Drivebound could not complete its container operation.`n$detail"
         }
+        Add-DriveboundDiagnostic -Message 'Docker Compose completed successfully.'
     }
     finally {
         Pop-Location
@@ -357,39 +412,69 @@ function Assert-DriveboundPorts {
     $listeners = [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
     foreach ($port in @(3000, 8000)) {
         if (-not ($listeners | Where-Object { $_.Port -eq $port })) { continue }
-        $owned = Invoke-DriveboundNative -FilePath (Get-Command docker).Source -Arguments @('ps', '--filter', "label=com.docker.compose.project=$ProjectName", '--filter', "publish=$port", '--format', '{{.ID}}') -TimeoutSeconds 10
-        if ($owned.ExitCode -ne 0) { throw 'Docker port ownership could not be checked. Open Docker Desktop and retry.' }
+        $owned = Invoke-DriveboundNative -FilePath (Get-DriveboundDockerCommand).Source -Arguments @('ps', '--filter', "label=com.docker.compose.project=$ProjectName", '--filter', "publish=$port", '--format', '{{.ID}}') -TimeoutSeconds 10
+        if ($owned.ExitCode -ne 0 -or $owned.TimedOut) { throw "Docker port ownership could not be checked.`n$(Get-DriveboundNativeFailure $owned)" }
         if (-not $owned.StdOut.Trim()) { throw "Port $port is already being used by another application. Close that application's local development server or ask the PC owner to free the port, then retry Drivebound Start. No services were stopped automatically." }
     }
 }
 
 function Wait-ForDrivebound {
-    $deadline = [DateTime]::UtcNow.AddMinutes(2)
+    param([ValidateRange(1, 900)][int]$TimeoutSeconds = 120)
+    Set-DriveboundStage -Stage 'Waiting for Drivebound API and website readiness'
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastApi = 'Not checked'; $lastFrontend = 'Not checked'
     do {
+        $apiReady = $false; $frontendReady = $false
         try {
             $health = Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/ready" -TimeoutSec 3
-            $frontend = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000' -TimeoutSec 3
-            if ($health.status -eq 'ready' -and $frontend.StatusCode -eq 200) {
-                return
-            }
+            $apiReady = $health.status -eq 'ready'
+            $lastApi = if ($apiReady) { 'Ready' } else { 'API returned a not-ready response' }
+        } catch {
+            $lastApi = Protect-DriveboundDiagnosticText -Text $_.Exception.Message
+            # /ready deliberately returns 503 with bounded status categories.
+            # Do not dump arbitrary response bodies (they could contain secrets).
+            try {
+                $health = $_.ErrorDetails.Message | ConvertFrom-Json
+                if ($health.status -eq 'not_ready') {
+                    $unready = @()
+                    foreach ($group in @('services', 'storage')) {
+                        foreach ($property in $health.$group.PSObject.Properties) {
+                            if ($property.Name -match '^[a-z_]{1,32}$' -and $property.Value -notin @('ok', 'not_configured')) { $unready += "$group/$($property.Name)" }
+                        }
+                    }
+                    $lastApi = 'Not ready: ' + ($unready -join ', ')
+                }
+            } catch { }
         }
-        catch { }
+        try {
+            $frontend = Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:3000' -TimeoutSec 3
+            $frontendReady = $frontend.StatusCode -eq 200
+            $lastFrontend = "HTTP $($frontend.StatusCode)"
+        } catch { $lastFrontend = Protect-DriveboundDiagnosticText -Text $_.Exception.Message }
+        if ($apiReady -and $frontendReady) {
+            Add-DriveboundDiagnostic -Message 'API and website readiness checks passed.'
+            return
+        }
         Start-Sleep -Seconds 2
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw "Drivebound is not ready yet. Check that all selected drives are connected and Docker Desktop shows backend, worker, scheduler, database, Redis, and frontend running. Use Drivebound Status for a redacted report, then retry Drivebound Start."
+    throw "Drivebound was not ready within $TimeoutSeconds seconds.`nAPI (port 8000): $lastApi`nWebsite (port 3000): $lastFrontend`nCheck the selected drives and Docker service state. Use Drivebound Status, then retry Drivebound Start."
 }
 
 function Start-Drivebound {
     param([switch]$Build)
+    Set-DriveboundStage -Stage 'Loading installation and checking approved storage'
     $state = Get-InstallationState
     if (-not $state) { throw 'Run Drivebound Setup first so your storage identity and owner can be verified.' }
     if ($SignInStartup -and $state.desired_state -eq 'stopped') { return }
     Assert-InstallationStorage $state
+    # Register secrets before build output could quote interpolated settings.
+    [void](Read-EnvironmentMap $Script:EnvironmentPath)
     Wait-ForDocker
+    Set-DriveboundStage -Stage 'Checking application ports and existing database storage'
     Assert-DriveboundPorts $state.compose_project_name
     if (-not $state.database_adoption_allowed) {
-        $existingVolume = Invoke-DriveboundNative -FilePath (Get-Command docker).Source -Arguments @('volume', 'ls', '--filter', "name=^$($state.compose_project_name)_postgres_data$", '--format', '{{.Name}}') -TimeoutSeconds 10
-        if ($existingVolume.ExitCode -ne 0) { throw 'Docker database storage could not be checked. Retry when Docker is ready.' }
+        $existingVolume = Invoke-DriveboundNative -FilePath (Get-DriveboundDockerCommand).Source -Arguments @('volume', 'ls', '--filter', "name=^$($state.compose_project_name)_postgres_data$", '--format', '{{.Name}}') -TimeoutSeconds 10
+        if ($existingVolume.ExitCode -ne 0 -or $existingVolume.TimedOut) { throw "Docker database storage could not be checked.`n$(Get-DriveboundNativeFailure $existingVolume)" }
         if ($existingVolume.StdOut.Trim()) { throw 'A database already exists for this installation, but its original credentials were not present during Setup. Recover its original .env before starting; Drivebound will not attach new keys to existing accounts.' }
         $state | Add-Member -NotePropertyName database_adoption_allowed -NotePropertyValue $true -Force
         # Persist before launching: a crash during up can safely retry the same credentials.
@@ -413,6 +498,7 @@ function Start-Drivebound {
 }
 
 function Initialize-Drivebound {
+    Set-DriveboundStage -Stage 'Checking setup files and existing installation'
     if (-not (Test-Path -LiteralPath $Script:EnvironmentTemplatePath)) {
         throw "The setup template .env.example is missing."
     }
@@ -481,6 +567,7 @@ function Initialize-Drivebound {
     try { $parsedEmail = New-Object Net.Mail.MailAddress($OwnerEmail) } catch { throw 'Enter a valid owner email address. No configuration was changed.' }
     if ($parsedEmail.Address -ne $OwnerEmail) { throw 'Enter only the owner email address, without a display name.' }
 
+    Set-DriveboundStage -Stage 'Selecting photo, upload, and protection folders'
     $defaultImports = Join-Path $Script:ProjectRoot "data\imports"
     $defaultManaged = Join-Path $Script:ProjectRoot "data"
     if (-not $ExistingPhotosPath) {
@@ -511,6 +598,7 @@ function Initialize-Drivebound {
         }
     }
 
+    Set-DriveboundStage -Stage 'Validating selected storage paths'
     $ExistingPhotosPath = Resolve-DriveboundPath $ExistingPhotosPath
     $ManagedDataPath = Resolve-DriveboundPath $ManagedDataPath
     $ProtectionDataPath = Resolve-DriveboundPath $ProtectionDataPath
@@ -539,6 +627,7 @@ function Initialize-Drivebound {
         }
     }
 
+    Set-DriveboundStage -Stage 'Preparing configuration while preserving existing secrets'
     $templateValues = Read-EnvironmentMap -Path $Script:EnvironmentTemplatePath
     $existingValues = Read-EnvironmentMap -Path $Script:EnvironmentPath
     if (@($existingValues.Keys | Where-Object { $_ -like '*_FILE' -and $existingValues[$_] }).Count -gt 0) { throw 'This installation uses file-backed secrets and needs its existing production deployment workflow. Guided Setup will not change its configuration.' }
@@ -575,7 +664,9 @@ function Initialize-Drivebound {
     if ((-not $values["METRICS_AUTH_TOKEN"]) -or ($canRefreshPlaceholders -and (Test-PlaceholderSecret -Value $values["METRICS_AUTH_TOKEN"]))) {
         $values["METRICS_AUTH_TOKEN"] = New-DriveboundSecret
     }
+    Register-DriveboundDiagnosticSecrets -Values $values
 
+    Set-DriveboundStage -Stage 'Verifying disk identities and preparing storage configuration'
     if (-not $state) {
         $installationId = [Guid]::NewGuid().ToString()
         $paths = @{imports = $ExistingPhotosPath; managed = $ManagedDataPath; protection = $ProtectionDataPath}
@@ -588,8 +679,8 @@ function Initialize-Drivebound {
             if (Test-PathOverlap $ExistingPhotosPath $identity.marker_directory) { throw 'Identity storage would overlap the imported photo folder. Choose separate photo and managed storage folders.' }
             $volumes[$group] = $identity
         }
-        $projectName = if ($existingValues['COMPOSE_PROJECT_NAME']) { $existingValues['COMPOSE_PROJECT_NAME'].Trim('"', "'") } else { ((Split-Path -Leaf $Script:ProjectRoot).ToLowerInvariant() -replace '[^a-z0-9_-]', '').TrimStart('-', '_') }
-        if (-not $projectName) { throw 'The project folder name cannot establish a stable Docker project identity.' }
+        $projectName = if ($values['COMPOSE_PROJECT_NAME']) { $values['COMPOSE_PROJECT_NAME'].Trim('"', "'") } else { ((Split-Path -Leaf $Script:ProjectRoot).ToLowerInvariant() -replace '[^a-z0-9_-]', '').TrimStart('-', '_') }
+        if ($projectName -cnotmatch '^[a-z0-9][a-z0-9_-]*$') { throw 'The configuration or project folder must establish a valid, lowercase Docker project identity.' }
         $protectionStatus = Get-ProtectionIndependence $volumes
         $state = [pscustomobject]@{schema_version = 1; installation_id = $installationId; compose_project_name = $projectName; owner_email = $OwnerEmail; paths = $paths; volumes = $volumes; protection_status = $protectionStatus; desired_state = 'stopped'; sign_in_startup = $false; database_adoption_allowed = [bool]($environmentAlreadyExisted -and -not $RefreshPlaceholderSecrets)}
     }
@@ -610,6 +701,7 @@ function Initialize-Drivebound {
         '.drivebound/installation.json' = $state | ConvertTo-Json -Depth 12
         '.drivebound/storage.json' = $storage | ConvertTo-Json -Depth 8
     }
+    Set-DriveboundStage -Stage 'Saving protected configuration and creating approved storage folders'
     if (-not (Get-InstallationState)) {
         $previousEnvironment = if ($environmentAlreadyExisted) { [IO.File]::ReadAllText($Script:EnvironmentPath) } else { $null }
         Write-DurableText $incompletePath (@{version = 1; contents = $contents; previous_environment = $previousEnvironment} | ConvertTo-Json -Depth 14)
@@ -640,6 +732,7 @@ function Initialize-Drivebound {
 
 function Register-DriveboundSignInStartup {
     param($State)
+    Set-DriveboundStage -Stage 'Registering automatic startup after Windows sign-in'
     $scriptPath = Join-Path $PSScriptRoot 'setup-drivebound.ps1'
     $taskName = "Drivebound-$($State.installation_id)"
     $command = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Action Start -SignInStartup -NonInteractive -NoBrowser' -f $scriptPath
@@ -654,6 +747,7 @@ function Register-DriveboundSignInStartup {
 }
 
 function Write-DriveboundStatus {
+    Set-DriveboundStage -Stage 'Checking current installation status'
     $state = Get-InstallationState
     $storageStatus = 'not_configured'
     if ($state) { try { Assert-InstallationStorage $state; $storageStatus = 'available' } catch { $storageStatus = 'unavailable_or_identity_mismatch' } }
@@ -673,7 +767,10 @@ if ($LibraryOnly) { return }
 
 $installationLock = $null
 try {
+    Initialize-DriveboundDiagnostics -ProjectRoot $Script:ProjectRoot -Action $Action
+    Set-DriveboundStage -Stage 'Acquiring setup lock and checking configuration recovery'
     $installationLock = Enter-InstallationLock
+    [void](Read-EnvironmentMap $Script:EnvironmentPath)
     Recover-ConfigurationTransaction
     switch ($Action) {
         "Setup" { Initialize-Drivebound }
@@ -693,10 +790,12 @@ try {
             Write-DriveboundStatus
         }
     }
+    Add-DriveboundDiagnostic -Message "Drivebound $Action completed successfully."
 }
 catch {
-    $message = $_.Exception.Message
-    Show-DriveboundMessage -Text $message -Kind "Error"
+    $message = Write-DriveboundFailure -ErrorRecord $_
+    try { Show-DriveboundMessage -Text $message -Kind "Error" }
+    catch { Write-Host $message -ForegroundColor Red }
     exit 1
 }
 finally {

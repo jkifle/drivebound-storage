@@ -11,7 +11,8 @@ RUN apt-get update \
 
 COPY pyproject.toml ./
 COPY app ./app
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir . && pip check
+RUN python -c "from sqlalchemy.ext.asyncio import create_async_engine"
 
 COPY alembic.ini ./
 COPY alembic ./alembic

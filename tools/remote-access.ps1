@@ -22,11 +22,27 @@ function Get-TailscaleExecutable {
     throw "Install Tailscale from https://tailscale.com/download/windows, sign in on this PC, and open Drivebound Remote Access again."
 }
 
+function Add-RemoteNativeFailureDiagnostic {
+    param($Result, [string]$Operation)
+    $outcome = if ($Result.TimedOut) { 'timed out' } else { "exit code $($Result.ExitCode)" }
+    # Tailscale status stdout contains private device inventory. Retain only the
+    # bounded/redacted error stream, never command arguments or status JSON.
+    $detail = Protect-DriveboundDiagnosticText -Text ([string]$Result.StdErr)
+    Add-DriveboundDiagnostic -Message ("Tailscale ${Operation}: $outcome." + $(if ($detail) { "`r`n$detail" } else { '' }))
+}
+
 function Invoke-TailscaleJson {
     param([string]$Executable, [string[]]$Arguments)
     $result = Invoke-DriveboundNative -FilePath $Executable -Arguments $Arguments -TimeoutSeconds 20
-    if ($result.ExitCode -ne 0) { throw "Tailscale is not ready. Open Tailscale, sign in, then retry Remote Access." }
-    try { return $result.StdOut | ConvertFrom-Json } catch { throw "Tailscale returned an unreadable status. Update Tailscale and retry." }
+    if ($result.ExitCode -ne 0) {
+        Add-RemoteNativeFailureDiagnostic -Result $result -Operation 'status check'
+        throw "Tailscale is not ready. Open Tailscale, sign in, then retry Remote Access."
+    }
+    try { return $result.StdOut | ConvertFrom-Json } catch {
+        # Do not retain the status JSON: it can identify the other tailnet devices.
+        Add-DriveboundDiagnostic -Message 'Tailscale status could not be parsed as JSON.'
+        throw "Tailscale returned an unreadable status. Update Tailscale and retry."
+    }
 }
 
 function Get-RemoteHostname {
@@ -73,14 +89,22 @@ function Remove-NewDriveboundServeRoutes {
     foreach ($port in $Ports) {
         try {
             $result = Invoke-DriveboundNative -FilePath $Executable -Arguments @('serve', "--https=$port", 'off') -TimeoutSeconds 20
-            if ($result.ExitCode -ne 0) { $allRemoved = $false }
-        } catch { $allRemoved = $false }
+            if ($result.ExitCode -ne 0) {
+                Add-RemoteNativeFailureDiagnostic -Result $result -Operation "route cleanup on port $port"
+                $allRemoved = $false
+            }
+        } catch {
+            [void](Write-DriveboundFailure -ErrorRecord $_)
+            $allRemoved = $false
+        }
     }
     return $allRemoved
 }
 
 function Get-RemoteEnvironment {
     param([hashtable]$Existing, [string]$DnsName, [hashtable]$Mail)
+    Register-DriveboundDiagnosticSecrets -Values $Existing
+    Register-DriveboundDiagnosticSecrets -Values @{ SMTP_USERNAME = $Mail.Username; SMTP_PASSWORD = $Mail.Password; SMTP_FROM = $Mail.From }
     if ($Existing.ENVIRONMENT -in @('production', 'staging')) {
         throw "This wizard is for the stationary-PC pilot. Keep this production installation's file-backed secrets and use its production deployment guide. No settings were changed."
     }
@@ -107,6 +131,7 @@ function Get-RemoteEnvironment {
         SMTP_FROM = (ConvertTo-DotEnvLiteral $Mail.From); SMTP_USE_TLS = 'true'
     }
     foreach ($key in $updates.Keys) { $values[$key] = $updates[$key] }
+    Register-DriveboundDiagnosticSecrets -Values $values
     return $values
 }
 
@@ -158,31 +183,46 @@ function Request-RemoteMailSettings {
 
 function Send-RemoteTestEmail {
     param([hashtable]$Mail, [string]$Recipient)
+    Register-DriveboundDiagnosticSecrets -Values @{ SMTP_USERNAME = $Mail.Username; SMTP_PASSWORD = $Mail.Password; SMTP_FROM = $Mail.From }
     $client = [Net.Mail.SmtpClient]::new($Mail.Host, [int]$Mail.Port)
     $client.EnableSsl = $true; $client.Timeout = 15000
     if ($Mail.Username) { $client.Credentials = [Net.NetworkCredential]::new($Mail.Username, $Mail.Password) }
     $message = [Net.Mail.MailMessage]::new($Mail.From, $Recipient, 'Drivebound email setup check', 'Your Drivebound PC reached your email provider. Return to the setup window to finish private remote access. This message contains no sign-in code or secrets.')
     try { $client.Send($message) }
-    catch { throw "The verification email could not be sent. Check the SMTP server, STARTTLS port, sender and app password with your email provider. No remote settings were applied." }
+    catch {
+        [void](Write-DriveboundFailure -ErrorRecord $_)
+        throw "The verification email could not be sent. Check the SMTP server, STARTTLS port, sender and app password with your email provider. No remote settings were applied."
+    }
     finally { $message.Dispose(); $client.Dispose() }
 }
 
 function Enable-DriveboundRemoteAccess {
+    Set-DriveboundStage -Stage 'Checking the existing Drivebound installation'
     $lock = Enter-InstallationLock
     try {
         Recover-ConfigurationTransaction
         $state = Get-InstallationState
         if (-not $state -or -not $state.owner_email) { throw "Run Drivebound Setup first and approve the account that owns this PC's photo folder." }
         $oldEnvironment = Read-EnvironmentMap -Path $Script:EnvironmentPath
+        Register-DriveboundDiagnosticSecrets -Values $oldEnvironment
+        Set-DriveboundStage -Stage 'Checking Tailscale connectivity and private routes'
         $tailscale = Get-TailscaleExecutable
         $dns = Get-RemoteHostname (Invoke-TailscaleJson $tailscale @('status', '--json'))
         $serve = Invoke-TailscaleJson $tailscale @('serve', 'status', '--json')
         $previouslyConfigured = $oldEnvironment.REMOTE_ACCESS_ENABLED -eq 'true' -and $oldEnvironment.APP_URL -eq "https://$dns"
         Assert-ServeRoutesSafe $serve $dns $previouslyConfigured
+        Set-DriveboundStage -Stage 'Collecting email-provider settings'
         $mail = Request-RemoteMailSettings $state.owner_email $dns
-        if (-not $mail) { return }
+        if (-not $mail) {
+            Add-DriveboundDiagnostic -Message 'Remote Access was cancelled before settings were changed.'
+            return
+        }
+        Register-DriveboundDiagnosticSecrets -Values @{ SMTP_USERNAME = $mail.Username; SMTP_PASSWORD = $mail.Password; SMTP_FROM = $mail.From }
+        Set-DriveboundStage -Stage 'Validating remote-access settings'
         $values = Get-RemoteEnvironment $oldEnvironment $dns $mail
+        Set-DriveboundStage -Stage 'Sending the email-provider connection test'
         Send-RemoteTestEmail $mail $state.owner_email
+        Set-DriveboundStage -Stage 'Saving secure remote-access settings'
         $oldContent = [IO.File]::ReadAllText($Script:EnvironmentPath)
         Invoke-ConfigurationTransaction -Contents @{ '.env' = (Get-EnvironmentContent -Values $values) }
         $createdPorts = New-Object 'System.Collections.Generic.List[int]'
@@ -190,6 +230,7 @@ function Enable-DriveboundRemoteAccess {
             # Publish only after the complete stack has loaded HTTPS/cookie/SMTP guards.
             # Build is required because the browser API origin is compiled into frontend assets.
             Start-Drivebound -Build
+            Set-DriveboundStage -Stage 'Enabling private Tailscale HTTPS routes'
             foreach ($port in @(443, 8443)) {
                 $localPort = if ($port -eq 443) { 3000 } else { 8000 }
                 $existingRoute = Get-RemoteProperty $serve.TCP ([string]$port)
@@ -200,27 +241,47 @@ function Enable-DriveboundRemoteAccess {
                 # turning off only this previously absent port cannot remove another service.
                 $createdPorts.Add($port)
                 $routeResult = Invoke-DriveboundNative -FilePath $tailscale -Arguments @('serve', '--bg', '--yes', "--https=$port", "http://127.0.0.1:$localPort") -TimeoutSeconds 60
-                if ($routeResult.ExitCode -ne 0) { throw 'Tailscale Serve could not start. Enable HTTPS certificates in your Tailscale network and retry.' }
+                if ($routeResult.ExitCode -ne 0) {
+                    Add-RemoteNativeFailureDiagnostic -Result $routeResult -Operation "HTTPS route setup on port $port"
+                    throw 'Tailscale Serve could not start. Enable HTTPS certificates in your Tailscale network and retry.'
+                }
             }
+            Set-DriveboundStage -Stage 'Verifying remote HTTPS connections'
             $verifiedServe = Invoke-TailscaleJson $tailscale @('serve', 'status', '--json')
             Assert-ServeRoutesSafe $verifiedServe $dns $true -RequireComplete
             [void](Invoke-WebRequest -UseBasicParsing -Uri "https://$dns/" -TimeoutSec 15)
             [void](Invoke-RestMethod -Uri "https://${dns}:8443/api/v1/ready" -TimeoutSec 15)
         } catch {
+            # Preserve the originating error before rollback or a friendly wrapper
+            # replaces it. Secrets were registered before SMTP/native operations.
+            [void](Write-DriveboundFailure -ErrorRecord $_)
+            Add-DriveboundDiagnostic -Message 'Remote setup failed; removing only newly-created routes before restoring the previous configuration.'
             $routesRemoved = Remove-NewDriveboundServeRoutes -Executable $tailscale -Ports $createdPorts.ToArray()
             if (-not $routesRemoved) {
                 throw "Remote setup did not finish and a new Tailscale route could not be removed. Secure HTTPS settings were kept. Close Tailscale or disable Drivebound's routes, then retry. Do not switch back to local settings while these routes are active."
             }
             Invoke-ConfigurationTransaction -Contents @{ '.env' = $oldContent }
-            try { Start-Drivebound -Build } catch { }
+            try { Start-Drivebound -Build } catch {
+                [void](Write-DriveboundFailure -ErrorRecord $_)
+                Add-DriveboundDiagnostic -Message 'Previous settings were restored, but restarting the local stack failed. Check Drivebound Start before retrying Remote Access.'
+            }
             throw "Remote setup did not pass its connection check. Previous configuration was restored. Open Drivebound Start to check local service health, enable Tailscale HTTPS if needed, then retry Remote Access. Existing Tailscale services were preserved."
         }
+        Set-DriveboundStage -Stage 'Finishing remote-access setup'
         if (-not $Script:RemoteNoBrowser) { Start-Process "https://$dns" -WindowStyle Hidden }
         Show-DriveboundMessage -Text "Private remote access is ready on this PC: https://$dns`r`n`r`nInstall and sign in to Tailscale on your phone, turn off Wi-Fi, and open this address. The mobile app server address is https://${dns}:8443. Test sign-in, browsing, download and upload before relying on remote backup. Keep this PC awake. Automatic Drivebound startup requires Windows sign-in."
     } finally { $lock.Dispose() }
 }
 
 if (-not $Script:RemoteLibraryOnly) {
-    try { Enable-DriveboundRemoteAccess }
-    catch { Show-DriveboundMessage -Text $_.Exception.Message -Kind Error; exit 1 }
+    try {
+        Initialize-DriveboundDiagnostics -ProjectRoot $Script:ProjectRoot -Action 'Remote Access'
+        Enable-DriveboundRemoteAccess
+        Add-DriveboundDiagnostic -Message 'Remote Access finished without an unhandled error.'
+    } catch {
+        $failureText = Write-DriveboundFailure -ErrorRecord $_
+        try { Show-DriveboundMessage -Text $failureText -Kind Error }
+        catch { Write-Host $failureText -ForegroundColor Red }
+        exit 1
+    }
 }
